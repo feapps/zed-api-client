@@ -1,0 +1,14 @@
+/target
+
+# Artefatos de build gerados pelo Zed ao instalar/compilar a dev extension.
+/extension.wasm
+/grammars/
+
+# Buffer com a resposta da última requisição.
+.http-response.http
+
+# Variáveis locais (pode conter credenciais) — copie de .env.example.
+.env
+
+# Permissões locais do Claude Code (específicas desta máquina).
+.claude/settings.local.json

@@ -1,0 +1,109 @@
+# =============================================================================
+# Arquivo de exemplo / documentação da extensão HTTP Request Client (Zed).
+#
+# Como usar:
+#   1. Ative "code_lens": "on" no settings.json do Zed.
+#   2. Clique no botão "Send request" que aparece acima de cada requisição.
+#   3. O resultado abre/atualiza em .http-response.http (mantenha-o num split).
+#
+# O HOST aponta para https://httpbin.org (serviço público que ecoa a
+# requisição), então todos os exemplos abaixo funcionam de verdade.
+#
+# Dica de sintaxe: coloque comentários ANTES do corpo (body). Comentários logo
+# após o body quebram o destaque de cor do restante do arquivo (limitação do
+# grammar tree-sitter-http). Ver README.md.
+# =============================================================================
+
+# Variáveis de arquivo — resolvem a partir do .env via {{$dotenv NOME}}.
+@HOST = {{$dotenv HOST}}
+@CONTENT_TYPE = {{$dotenv CONTENT_TYPE}}
+@USERNAME = {{$dotenv USERNAME}}
+@API_KEY = {{$dotenv API_KEY}}
+
+### GET ----------------------------------------------------------------------
+
+# @name getExample
+# GET simples com query string multilinha (linhas iniciadas por ? e &).
+GET {{HOST}}/get
+    ?page=1
+    &page_size=10
+Accept: {{CONTENT_TYPE}}
+###
+
+### POST (login de exemplo) --------------------------------------------------
+
+# @name login
+# POST com corpo JSON. O httpbin ecoa o corpo enviado dentro do campo "json",
+# o que permite demonstrar o encadeamento nas requisições seguintes.
+POST {{HOST}}/anything/login
+content-type: {{CONTENT_TYPE}}
+
+{
+  "user": "{{USERNAME}}",
+  "key": "{{API_KEY}}"
+}
+###
+
+### Encadeamento de resposta -------------------------------------------------
+
+# @name authenticatedGet
+# Usa dados da resposta de "login" (rode "login" antes):
+#   - body:   {{login.response.body.json.key}}
+#   - status: {{login.response.status}}
+#   - header: {{login.response.headers.content-type}}
+GET {{HOST}}/anything/profile
+Accept: {{CONTENT_TYPE}}
+Authorization: Bearer {{login.response.body.json.key}}
+X-Prev-Status: {{login.response.status}}
+X-Prev-Content-Type: {{login.response.headers.content-type}}
+###
+
+### PUT -----------------------------------------------------------------------
+
+# @name updateExample
+# PUT com corpo JSON.
+PUT {{HOST}}/put
+content-type: {{CONTENT_TYPE}}
+
+{
+  "name": "novo nome",
+  "active": true
+}
+###
+
+### PATCH ---------------------------------------------------------------------
+
+# @name patchExample
+# PATCH com corpo JSON.
+PATCH {{HOST}}/patch
+content-type: {{CONTENT_TYPE}}
+
+{
+  "active": false
+}
+###
+
+### DELETE --------------------------------------------------------------------
+
+# @name deleteExample
+# DELETE com header de autorização encadeado.
+DELETE {{HOST}}/delete
+Authorization: Bearer {{login.response.body.json.key}}
+###
+
+### Upload (multipart + inclusão de arquivo) ---------------------------------
+
+# @name uploadExample
+# Envio multipart usando `< caminho` para inserir o conteúdo de um arquivo
+# (relativo à pasta deste .http). Use `<@ caminho` para também resolver
+# {{...}} dentro do conteúdo incluído.
+POST {{HOST}}/post
+content-type: multipart/form-data; boundary=EXAMPLE-BOUNDARY
+
+--EXAMPLE-BOUNDARY
+Content-Disposition: form-data; name="file"; filename="example.csv"
+Content-Type: text/csv
+
+< ./example.csv
+--EXAMPLE-BOUNDARY--
+###
