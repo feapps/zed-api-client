@@ -1,0 +1,65 @@
+name: release
+
+# Publica os binários do language server (crate `lsp-server`) como assets do
+# GitHub Release. O `src/lib.rs` da extensão baixa o asset da plataforma atual
+# com o nome EXATO `http-request-client-lsp-<os>-<arch>.gz` (um gzip do binário
+# cru) — este workflow precisa produzir esses nomes.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag do release para anexar os assets (ex.: v0.1.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-latest,   target: aarch64-apple-darwin,      os: macos,   arch: aarch64 }
+          - { runner: macos-latest,   target: x86_64-apple-darwin,       os: macos,   arch: x86_64 }
+          - { runner: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  os: linux,   arch: x86_64 }
+          - { runner: ubuntu-latest,  target: aarch64-unknown-linux-gnu, os: linux,   arch: aarch64 }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc,    os: windows, arch: x86_64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Configura linker/sysroot para cross-compile no Linux (inclui aarch64).
+      - name: Cross toolchain (Linux)
+        if: matrix.os == 'linux'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p http_request_client_lsp
+
+      # gzip do binário cru → DownloadedFileType::Gzip no lib.rs.
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/http-request-client-lsp"
+          [ "${{ matrix.os }}" = "windows" ] && bin="${bin}.exe"
+          out="http-request-client-lsp-${{ matrix.os }}-${{ matrix.arch }}.gz"
+          gzip -c -9 "$bin" > "$out"
+          ls -l "$out"
+
+      - name: Upload ao release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: http-request-client-lsp-${{ matrix.os }}-${{ matrix.arch }}.gz
