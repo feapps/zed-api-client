@@ -13,8 +13,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use lsp_server::{Connection, Message, Notification, Request as LspRequest, RequestId, Response};
@@ -27,23 +27,56 @@ use lsp_types::{
 };
 use serde_json::Value;
 
-const LOG_PATH: &str = "/tmp/http-request-client-lsp.log";
 const CMD_SEND: &str = "http.sendRequest";
 const CMD_NOOP: &str = "http.noop";
-/// Nome do arquivo de resultado, criado dentro do worktree para que o file
-/// watcher do Zed recarregue o buffer aberto automaticamente.
-const RESULT_FILENAME: &str = ".http-response.http";
+/// Pasta dos arquivos de resultado, fora do worktree — assim eles não sujam o
+/// projeto nem precisam de `.gitignore`.
+///
+/// Já esteve documentado aqui que o arquivo *precisava* estar no worktree para
+/// o file watcher do Zed recarregar o buffer. Foi testado e é falso: o
+/// `applyEdit` + `CreateFile` abre a aba num caminho de `/tmp` do mesmo jeito
+/// (o Zed cria um worktree invisível de arquivo único e registra o language
+/// server nele) e a escrita em disco gera `didChange` normalmente — worktrees
+/// de arquivo único também são observados.
+const RESULT_DIR: &str = "requests";
+/// Nome do arquivo de resultado quando não se sabe o workspace.
+const RESULT_FALLBACK: &str = "http-response.http";
+/// Tempo mínimo que o `⏳ Enviando…` fica no lugar do Code Lens.
+///
+/// O Zed espera 50 ms (debounce) + 30 ms antes de pedir os lenses de volta, e
+/// cada `workspace/codeLens/refresh` novo *substitui* o pedido pendente em vez
+/// de enfileirá-lo. Numa requisição rápida (localhost responde em poucos ms) o
+/// refresh do fim cancela o do começo e o indicador nunca chega a ser
+/// desenhado. Segurar o estado de loading afasta os dois refreshes o bastante
+/// para o Zed renderizar o do meio — e dá tempo de o olho pegar.
+const MIN_LOADING: Duration = Duration::from_millis(400);
 
 static COUNTER: AtomicI32 = AtomicI32::new(1);
 /// Serializa as escritas no arquivo de resultado.
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
+/// Arquivo de log, definido por [`init_log`] a partir da raiz do workspace.
+static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 fn next_n() -> i32 {
     COUNTER.fetch_add(1, Ordering::SeqCst)
 }
 
+/// Aponta o log para um arquivo por workspace.
+///
+/// O Zed sobe um language server por projeto aberto, e todos eles rodavam na
+/// mesma máquina escrevendo no mesmo caminho fixo — os logs se misturavam e
+/// davam a impressão de um projeto estar fazendo o que era do outro.
+fn init_log(root: Option<&str>) {
+    let name = root
+        .and_then(|r| Path::new(r).file_name())
+        .map(|n| format!("http-request-client-lsp-{}.log", n.to_string_lossy()))
+        .unwrap_or_else(|| "http-request-client-lsp.log".to_string());
+    let _ = LOG_PATH.set(std::env::temp_dir().join(name));
+}
+
 fn log(msg: impl AsRef<str>) {
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(LOG_PATH) {
+    let path = LOG_PATH.get_or_init(|| std::env::temp_dir().join("http-request-client-lsp.log"));
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "{}", msg.as_ref());
     }
 }
@@ -79,6 +112,23 @@ struct State {
 }
 
 type Shared = Arc<Mutex<State>>;
+
+impl State {
+    /// Texto de um documento: o buffer sincronizado por didOpen/didChange ou,
+    /// na falta dele, o conteúdo em disco.
+    ///
+    /// O fallback existe porque os Code Lens não podem depender do
+    /// bookkeeping de didOpen/didClose do cliente: basta um didClose a mais
+    /// (abas de preview, o mesmo arquivo em dois painéis) para a aba ficar sem
+    /// os botões "Send request" até ser reaberta.
+    fn document_text(&self, uri: &str) -> Option<String> {
+        if let Some(text) = self.docs.get(uri) {
+            return Some(text.clone());
+        }
+        let path = uri.strip_prefix("file://")?;
+        std::fs::read_to_string(path).ok()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Parsing do formato .http (REST Client)
@@ -468,25 +518,41 @@ fn load_dotenv(file_dir: Option<&Path>, root: Option<&str>) -> HashMap<String, S
 // Buffer de resultado
 // ---------------------------------------------------------------------------
 
+/// Caminho do resultado: um arquivo por workspace, para que dois projetos
+/// abertos ao mesmo tempo não sobrescrevam a resposta um do outro. O nome do
+/// workspace também identifica a aba, que fica fora do projeto.
 fn result_path(root: Option<&str>) -> PathBuf {
-    match root {
-        Some(r) => Path::new(r).join(RESULT_FILENAME),
-        None => std::env::temp_dir().join(RESULT_FILENAME),
-    }
+    let name = root
+        .and_then(|r| Path::new(r).file_name())
+        .map(|n| format!("{}.http", n.to_string_lossy()))
+        .unwrap_or_else(|| RESULT_FALLBACK.to_string());
+    std::env::temp_dir().join(RESULT_DIR).join(name)
 }
 
 fn result_uri_for(root: Option<&str>) -> String {
     format!("file://{}", result_path(root).display())
 }
 
-/// Atualiza o resultado escrevendo direto no arquivo do worktree. Se o buffer
-/// aberto estiver LIMPO (salvo), o watcher do Zed recarrega no lugar — sem
+/// Garante a pasta de resultados. Chamada a cada escrita, e não uma vez na
+/// inicialização, porque `/tmp` é limpo periodicamente em muitas distros e a
+/// pasta pode sumir no meio da sessão.
+fn ensure_result_dir(path: &Path) {
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            log(format!("falha ao criar {}: {e}", dir.display()));
+        }
+    }
+}
+
+/// Atualiza o resultado escrevendo direto no arquivo. Se o buffer aberto
+/// estiver LIMPO (salvo), o watcher do Zed recarrega no lugar — sem
 /// `applyEdit`, portanto sem "revelar"/roubar o foco. Depende do buffer estar
 /// salvo (via autosave); por isso as atualizações usam este caminho e a
 /// abertura inicial usa [`open_result`].
 fn write_result(root: Option<&str>, content: &str) {
     let _guard = WRITE_LOCK.lock().unwrap();
     let path = result_path(root);
+    ensure_result_dir(&path);
     if let Err(e) = std::fs::write(&path, content) {
         log(format!("falha ao escrever resultado em {}: {e}", path.display()));
     }
@@ -497,33 +563,47 @@ fn write_result(root: Option<&str>, content: &str) {
 /// O buffer nasce "sujo"; o autosave o limpa em seguida, e as atualizações
 /// posteriores passam a usar [`write_result`] (disco), sem reveal.
 fn open_result(sender: &Sender<Message>, root: Option<&str>, content: &str) {
-    let _guard = WRITE_LOCK.lock().unwrap();
     let path = result_path(root);
     // Cria um arquivo realmente novo — só assim o Zed abre uma aba visível.
-    let _ = std::fs::remove_file(&path);
+    {
+        let _guard = WRITE_LOCK.lock().unwrap();
+        ensure_result_dir(&path);
+        let _ = std::fs::remove_file(&path);
+    }
+    apply_result_edit(sender, root, content, true);
+}
 
+/// Substitui o conteúdo do buffer de resultado via `applyEdit`, sem criar o
+/// arquivo. Ao contrário de [`write_result`], funciona mesmo com o buffer
+/// "sujo" (não salvo) — o watcher do Zed ignora mudanças em disco nesse caso.
+fn edit_result(sender: &Sender<Message>, root: Option<&str>, content: &str) {
+    apply_result_edit(sender, root, content, false);
+}
+
+fn apply_result_edit(sender: &Sender<Message>, root: Option<&str>, content: &str, create: bool) {
     let uri_str = result_uri_for(root);
     let Ok(uri) = Uri::from_str(&uri_str) else {
         log(format!("uri de resultado inválida: {uri_str}"));
         return;
     };
-    let ops = vec![
-        DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+    let mut ops = Vec::new();
+    if create {
+        ops.push(DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
             uri: uri.clone(),
             options: Some(CreateFileOptions {
                 overwrite: Some(false),
                 ignore_if_exists: Some(false),
             }),
             annotation_id: None,
-        })),
-        DocumentChangeOperation::Edit(TextDocumentEdit {
-            text_document: OptionalVersionedTextDocumentIdentifier { uri, version: None },
-            edits: vec![OneOf::Left(TextEdit {
-                range: Range::new(Position::new(0, 0), Position::new(u32::MAX, u32::MAX)),
-                new_text: content.to_string(),
-            })],
-        }),
-    ];
+        })));
+    }
+    ops.push(DocumentChangeOperation::Edit(TextDocumentEdit {
+        text_document: OptionalVersionedTextDocumentIdentifier { uri, version: None },
+        edits: vec![OneOf::Left(TextEdit {
+            range: Range::new(Position::new(0, 0), Position::new(u32::MAX, u32::MAX)),
+            new_text: content.to_string(),
+        })],
+    }));
     let params = ApplyWorkspaceEditParams {
         label: Some("Resposta HTTP".into()),
         edit: WorkspaceEdit {
@@ -542,6 +622,49 @@ fn open_result(sender: &Sender<Message>, root: Option<&str>, content: &str) {
     }
 }
 
+/// Indicador de progresso na barra de status do Zed (`$/progress`).
+///
+/// É o único indicador que não depende de layout nem de foco. O Code Lens
+/// `⏳ Enviando…` não serve para isso: o Zed só desenha o que ele pediu, e ele
+/// para de pedir os lenses do `.http` de origem assim que o buffer de
+/// resultado vira o editor ativo — o que acontece já na primeira requisição.
+struct Progress<'a> {
+    sender: &'a Sender<Message>,
+    token: String,
+}
+
+impl<'a> Progress<'a> {
+    fn begin(sender: &'a Sender<Message>, title: impl Into<String>) -> Self {
+        let token = format!("http-request-{}", next_n());
+        // O Zed descarta $/progress de tokens que não foram registrados por
+        // este request, e o registro dele roda numa task separada — daí a
+        // pausa antes do "begin".
+        let _ = sender.send(Message::Request(LspRequest {
+            id: RequestId::from(next_n()),
+            method: "window/workDoneProgress/create".into(),
+            params: serde_json::json!({ "token": token }),
+        }));
+        std::thread::sleep(Duration::from_millis(30));
+        let _ = sender.send(Message::Notification(Notification {
+            method: "$/progress".into(),
+            params: serde_json::json!({
+                "token": token,
+                "value": { "kind": "begin", "title": title.into(), "cancellable": false },
+            }),
+        }));
+        Self { sender, token }
+    }
+}
+
+impl Drop for Progress<'_> {
+    fn drop(&mut self) {
+        let _ = self.sender.send(Message::Notification(Notification {
+            method: "$/progress".into(),
+            params: serde_json::json!({ "token": self.token, "value": { "kind": "end" } }),
+        }));
+    }
+}
+
 fn refresh_code_lens(sender: &Sender<Message>) {
     let id = RequestId::from(next_n());
     let _ = sender.send(Message::Request(LspRequest {
@@ -551,7 +674,35 @@ fn refresh_code_lens(sender: &Sender<Message>) {
     }));
 }
 
-#[allow(dead_code)]
+/// Instantes (desde o `didOpen`) em que os Code Lens são re-pedidos.
+///
+/// Quem desenha os lenses é o *editor*, e ele só busca os buffers que já estão
+/// registrados e visíveis nele. Duas corridas fazem essa busca cair no vazio, e
+/// nenhuma delas reagenda nada depois:
+///
+/// - abrir um segundo `.http`: a busca pode chegar antes do registro do buffer;
+/// - abrir o Zed com `.http` já abertos: a restauração do workspace é
+///   assíncrona, então a busca pode acontecer antes de o editor existir. O
+///   servidor chega a responder os lenses (dá para ver no log) e mesmo assim a
+///   aba fica sem botões, até ser fechada e reaberta.
+///
+/// Os pedidos tardios cobrem as duas. São baratos: cada um só faz o Zed
+/// re-perguntar os lenses dos `.http` visíveis.
+const LENS_NUDGES_MS: [u64; 4] = [50, 400, 1_500, 4_000];
+
+/// Pede o refresh dos Code Lens algumas vezes depois de um `didOpen`.
+fn nudge_code_lens(sender: &Sender<Message>) {
+    let sender = sender.clone();
+    std::thread::spawn(move || {
+        let mut previous = 0;
+        for at in LENS_NUDGES_MS {
+            std::thread::sleep(Duration::from_millis(at - previous));
+            previous = at;
+            refresh_code_lens(&sender);
+        }
+    });
+}
+
 fn show_message(sender: &Sender<Message>, typ: MessageType, message: impl Into<String>) {
     let message = message.into();
     if let Ok(params) = serde_json::to_value(ShowMessageParams { typ, message }) {
@@ -599,6 +750,8 @@ fn perform_request(
     file_vars: HashMap<String, String>,
     dotenv: HashMap<String, String>,
     root: Option<String>,
+    // Quando o `⏳ Enviando…` foi pedido, para respeitar MIN_LOADING.
+    loading_since: Instant,
 ) {
     // Snapshot das respostas anteriores (para encadeamento) sem segurar o lock.
     let responses = state.lock().unwrap().responses.clone();
@@ -629,6 +782,23 @@ fn perform_request(
     });
 
     log(format!("=> {method} {url}"));
+
+    // Indicador de progresso na barra de status, encerrado no fim desta função
+    // (inclusive em caso de erro) pelo Drop.
+    let _progress = Progress::begin(sender, format!("Enviando {method} {url}"));
+
+    // Feedback imediato no painel de resultado: "Enviando…" no lugar da resposta
+    // anterior. É o que dá para garantir — o Code Lens depende de o Zed re-pedir
+    // os lenses do .http de origem, coisa que ele deixa de fazer assim que o
+    // buffer de resultado vira o editor ativo.
+    let result_uri = result_uri_for(root.as_deref());
+    let was_open = state.lock().unwrap().docs.contains_key(&result_uri);
+    let placeholder = format!("# ⏳ Enviando…\n\n{method} {url}\n");
+    if was_open {
+        write_result(root.as_deref(), &placeholder);
+    } else {
+        open_result(sender, root.as_deref(), &placeholder);
+    }
 
     // Se sobrou algum {{...}} sem resolver, aborta com um erro claro em vez de
     // mandar uma URI/headers inválidos ao ureq ("invalid uri character").
@@ -680,18 +850,22 @@ fn perform_request(
         }
     };
 
-    // Aberto (e salvo) → escreve em disco, o watcher recarrega sem reveal.
-    // Fechado → abre a aba via applyEdit; o autosave a limpa em seguida.
-    let result_uri = result_uri_for(root.as_deref());
-    let is_open = state.lock().unwrap().docs.contains_key(&result_uri);
-    log(format!("resultado is_open={is_open} ({result_uri})"));
-    if is_open {
+    // Já estava aberto (e salvo) → escreve em disco, o watcher recarrega sem
+    // reveal. Se fomos nós que acabamos de abrir a aba com o "Enviando…", o
+    // buffer ainda pode estar sujo e o watcher ignoraria o disco — então a
+    // resposta vai por applyEdit, que substitui o conteúdo de qualquer jeito.
+    log(format!("resultado was_open={was_open} ({result_uri})"));
+    if was_open {
         write_result(root.as_deref(), &content);
     } else {
-        open_result(sender, root.as_deref(), &content);
+        edit_result(sender, root.as_deref(), &content);
     }
 
-    // Limpa o loading e atualiza os Code Lens.
+    // Limpa o loading e atualiza os Code Lens. O resultado já está escrito, então
+    // a espera de MIN_LOADING só atrasa o botão voltar ao normal.
+    if let Some(rest) = MIN_LOADING.checked_sub(loading_since.elapsed()) {
+        std::thread::sleep(rest);
+    }
     state.lock().unwrap().inflight.remove(&(uri, req.line));
     refresh_code_lens(sender);
 }
@@ -743,7 +917,6 @@ fn do_http(
 // ---------------------------------------------------------------------------
 
 fn main() -> anyhow::Result<()> {
-    log("\n=== http request client lsp starting ===");
     let (connection, io_threads) = Connection::stdio();
 
     let capabilities = ServerCapabilities {
@@ -769,6 +942,9 @@ fn main() -> anyhow::Result<()> {
                 .and_then(|u| u.strip_prefix("file://"))
                 .map(String::from)
         });
+    // Só agora sabemos o workspace, e é ele que dá o nome do arquivo de log.
+    init_log(root_path.as_deref());
+    log("\n=== http request client lsp starting ===");
     log(format!("root_path = {root_path:?}"));
 
     let state: Shared = Arc::new(Mutex::new(State {
@@ -822,6 +998,9 @@ fn handle_notification(
                 ) {
                     log(format!("<- didOpen {uri}"));
                     state.lock().unwrap().docs.insert(uri.to_string(), text.to_string());
+                    if uri != result_uri {
+                        nudge_code_lens(sender);
+                    }
                 }
             }
         }
@@ -870,6 +1049,11 @@ fn handle_request(
             let params: CodeLensParams = serde_json::from_value(req.params)?;
             let uri = params.text_document.uri.as_str().to_string();
             let lenses = code_lenses(state, result_uri, &uri);
+            let sending = lenses
+                .iter()
+                .filter(|l| l.command.as_ref().is_some_and(|c| c.command == CMD_NOOP))
+                .count();
+            log(format!("-> codeLens {uri}: {} lens, {sending} enviando", lenses.len()));
             connection.sender.send(Message::Response(Response::new_ok(req.id, lenses)))?;
         }
         "workspace/executeCommand" => {
@@ -895,7 +1079,7 @@ fn code_lenses(state: &Shared, result_uri: &str, uri: &str) -> Vec<CodeLens> {
         return Vec::new();
     }
     let guard = state.lock().unwrap();
-    let text = guard.docs.get(uri).cloned().unwrap_or_default();
+    let text = guard.document_text(uri).unwrap_or_default();
     let (_vars, reqs) = parse_document(&text);
 
     reqs.into_iter()
@@ -942,7 +1126,7 @@ fn handle_execute_command(connection: &Connection, state: &Shared, params: Execu
     // Localiza a requisição e as variáveis de arquivo a partir do texto guardado.
     let (text, root_path) = {
         let guard = state.lock().unwrap();
-        (guard.docs.get(&uri).cloned(), guard.root_path.clone())
+        (guard.document_text(&uri), guard.root_path.clone())
     };
     let Some(text) = text else {
         log(format!("documento não encontrado: {uri}"));
@@ -954,6 +1138,26 @@ fn handle_execute_command(connection: &Connection, state: &Shared, params: Execu
         return;
     };
 
+    // Impede empilhar duas execuções da mesma requisição. A garantia tem que
+    // estar aqui, e não na aparência do Code Lens: o Zed só desenha os lenses
+    // que ele pede, e ele para de pedir os do `.http` de origem assim que o
+    // painel de resultado vira o editor ativo — então o botão pode continuar
+    // dizendo "Send request" mesmo com a requisição em andamento.
+    // `insert` devolve false quando a chave já estava lá.
+    if !state.lock().unwrap().inflight.insert((uri.clone(), line)) {
+        let what = req
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{} {}", req.method, req.url));
+        log(format!("clique ignorado, já em andamento: {what} ({uri}:{line})"));
+        show_message(
+            &connection.sender,
+            MessageType::WARNING,
+            format!("⏳ {what} já está em andamento — aguarde a resposta."),
+        );
+        return;
+    }
+
     // Procura o .env a partir da pasta do arquivo .http, subindo até a raiz.
     let file_dir = uri
         .strip_prefix("file://")
@@ -962,14 +1166,14 @@ fn handle_execute_command(connection: &Connection, state: &Shared, params: Execu
         .map(|p| p.to_path_buf());
     let dotenv = load_dotenv(file_dir.as_deref(), root_path.as_deref());
 
-    // Marca loading e atualiza os lenses (mostra o ⏳ no lugar do botão).
-    state.lock().unwrap().inflight.insert((uri.clone(), line));
+    // Pede o ⏳ no lugar do botão (o Zed atende quando está pedindo os lenses).
     let sender = connection.sender.clone();
     refresh_code_lens(&sender);
+    let loading_since = Instant::now();
 
     // Faz a requisição em background para não travar o loop do LSP.
     let state = Arc::clone(state);
     std::thread::spawn(move || {
-        perform_request(&state, &sender, uri, req, file_vars, dotenv, root_path);
+        perform_request(&state, &sender, uri, req, file_vars, dotenv, root_path, loading_since);
     });
 }

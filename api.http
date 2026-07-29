@@ -4,7 +4,8 @@
 # Como usar:
 #   1. Ative "code_lens": "on" no settings.json do Zed.
 #   2. Clique no botão "Send request" que aparece acima de cada requisição.
-#   3. O resultado abre/atualiza em .http-response.http (mantenha-o num split).
+#   3. O resultado abre/atualiza em /tmp/requests/<workspace>.http
+#      (mantenha a aba num split ao lado — ver README).
 #
 # O HOST aponta para https://httpbin.org (serviço público que ecoa a
 # requisição), então todos os exemplos abaixo funcionam de verdade.
@@ -24,9 +25,12 @@
 
 # @name getExample
 # GET simples com query string multilinha (linhas iniciadas por ? e &).
+# Parâmetros podem ser comentados individualmente com # ou // — a linha fica
+# com cor de comentário e não é enviada.
 GET {{HOST}}/get
     ?page=1
     &page_size=10
+    # &sort=asc
 Accept: {{CONTENT_TYPE}}
 ###
 

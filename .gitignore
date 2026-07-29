@@ -4,9 +4,6 @@
 /extension.wasm
 /grammars/
 
-# Buffer com a resposta da última requisição.
-.http-response.http
-
 # Variáveis locais (pode conter credenciais) — copie de .env.example.
 .env
 
