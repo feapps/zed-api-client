@@ -56,9 +56,87 @@ static COUNTER: AtomicI32 = AtomicI32::new(1);
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// Arquivo de log, definido por [`init_log`] a partir da raiz do workspace.
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+/// Diretório privado desta sessão em `temp_dir()`, criado com permissão 0700 e
+/// nome aleatório. Todos os artefatos (buffers de resultado e logs) vivem
+/// dentro dele — assim outro usuário da máquina não consegue ler as respostas
+/// (que podem conter tokens) nem plantar um symlink para desviar as escritas,
+/// já que não consegue nem atravessar o diretório.
+static ARTIFACT_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 fn next_n() -> i32 {
     COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Gera um token hex aleatório (16 bytes de `/dev/urandom`; recorre a
+/// pid + relógio se não der para ler). Usado no nome do diretório privado, para
+/// um atacante não conseguir prever nem pré-criar o caminho.
+fn random_token() -> String {
+    let mut buf = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read as _;
+        if f.read_exact(&mut buf).is_ok() {
+            let mut s = String::with_capacity(32);
+            for b in buf {
+                s.push_str(&format!("{b:02x}"));
+            }
+            return s;
+        }
+    }
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{pid:x}{nanos:x}")
+}
+
+/// Cria um diretório com permissão restrita (0700 no Unix). Com
+/// `recursive = false` falha se o diretório já existir — o que impede reusar um
+/// diretório pré-plantado por outro usuário.
+fn create_dir_restricted(path: &Path, recursive: bool) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(recursive);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        b.mode(0o700);
+    }
+    b.create(path)
+}
+
+/// Abre um arquivo para escrita truncando, com permissão 0600 no Unix.
+fn open_write_restricted(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        o.mode(0o600);
+    }
+    o.open(path)
+}
+
+/// Diretório privado da sessão (ver [`ARTIFACT_DIR`]). Se a criação falhar
+/// (caso raríssimo), recorre a `temp_dir()` direto e avisa no stderr — não em
+/// `log`, que escreve justamente aqui dentro.
+fn artifact_dir() -> &'static Path {
+    ARTIFACT_DIR
+        .get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("http-request-client-{}", random_token()));
+            match create_dir_restricted(&dir, false) {
+                Ok(()) => dir,
+                Err(e) => {
+                    eprintln!(
+                        "http-request-client-lsp: não consegui criar {} ({e}); usando {} — \
+                         artefatos podem ficar legíveis por outros usuários",
+                        dir.display(),
+                        std::env::temp_dir().display()
+                    );
+                    std::env::temp_dir()
+                }
+            }
+        })
+        .as_path()
 }
 
 /// Aponta o log para um arquivo por workspace.
@@ -71,12 +149,19 @@ fn init_log(root: Option<&str>) {
         .and_then(|r| Path::new(r).file_name())
         .map(|n| format!("http-request-client-lsp-{}.log", n.to_string_lossy()))
         .unwrap_or_else(|| "http-request-client-lsp.log".to_string());
-    let _ = LOG_PATH.set(std::env::temp_dir().join(name));
+    let _ = LOG_PATH.set(artifact_dir().join(name));
 }
 
 fn log(msg: impl AsRef<str>) {
-    let path = LOG_PATH.get_or_init(|| std::env::temp_dir().join("http-request-client-lsp.log"));
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    let path = LOG_PATH.get_or_init(|| artifact_dir().join("http-request-client-lsp.log"));
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        o.mode(0o600);
+    }
+    if let Ok(mut f) = o.open(path) {
         let _ = writeln!(f, "{}", msg.as_ref());
     }
 }
@@ -410,13 +495,47 @@ fn collect_unresolved(s: &str, out: &mut Vec<String>) {
 
 /// Lê um arquivo referenciado por `< caminho`, resolvendo relativo a `base_dir`
 /// quando o caminho não é absoluto. Conteúdo não-UTF8 é lido com perda.
-fn read_include(base_dir: Option<&Path>, path: &str) -> Option<String> {
+///
+/// A leitura é confinada ao workspace (`root`), ou à pasta do próprio `.http`
+/// quando não há workspace: o caminho é canonicalizado (resolvendo `..` e
+/// symlinks) e recusado se escapar do limite. Sem isso, um `.http` malicioso
+/// poderia incluir `/etc/passwd` ou `../../.ssh/id_rsa` e enviar o conteúdo
+/// para uma URL controlada por ele.
+fn read_include(base_dir: Option<&Path>, root: Option<&Path>, path: &str) -> Option<String> {
     let p = Path::new(path);
     let full = if p.is_absolute() {
         p.to_path_buf()
     } else {
         base_dir?.join(p)
     };
+    // Canonicaliza para resolver `..`/symlinks antes de checar o limite; um erro
+    // aqui também cobre o caso "arquivo não encontrado".
+    let full = match full.canonicalize() {
+        Ok(f) => f,
+        Err(e) => {
+            log(format!("falha ao incluir arquivo {}: {e}", full.display()));
+            return None;
+        }
+    };
+    // Limite permitido: a raiz do workspace, ou a pasta do .http se não houver.
+    match root.or(base_dir).and_then(|b| b.canonicalize().ok()) {
+        Some(b) if full.starts_with(&b) => {}
+        Some(b) => {
+            log(format!(
+                "inclusão bloqueada: {} está fora de {}",
+                full.display(),
+                b.display()
+            ));
+            return None;
+        }
+        None => {
+            log(format!(
+                "inclusão bloqueada: sem limite de workspace para validar {}",
+                full.display()
+            ));
+            return None;
+        }
+    }
     match std::fs::read(&full) {
         Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
         Err(e) => {
@@ -433,6 +552,7 @@ fn read_include(base_dir: Option<&Path>, path: &str) -> Option<String> {
 fn expand_file_includes(
     body: &str,
     base_dir: Option<&Path>,
+    root: Option<&Path>,
     file_vars: &HashMap<String, String>,
     dotenv: &HashMap<String, String>,
     responses: &HashMap<String, StoredResponse>,
@@ -441,12 +561,12 @@ fn expand_file_includes(
     for line in body.lines() {
         let t = line.trim_start();
         if let Some(rest) = t.strip_prefix("<@") {
-            match read_include(base_dir, rest.trim()) {
+            match read_include(base_dir, root, rest.trim()) {
                 Some(c) => out.push(resolve_vars(&c, file_vars, dotenv, responses)),
                 None => out.push(line.to_string()),
             }
         } else if let Some(rest) = t.strip_prefix('<') {
-            match read_include(base_dir, rest.trim()) {
+            match read_include(base_dir, root, rest.trim()) {
                 Some(c) => out.push(c),
                 None => out.push(line.to_string()),
             }
@@ -526,7 +646,7 @@ fn result_path(root: Option<&str>) -> PathBuf {
         .and_then(|r| Path::new(r).file_name())
         .map(|n| format!("{}.http", n.to_string_lossy()))
         .unwrap_or_else(|| RESULT_FALLBACK.to_string());
-    std::env::temp_dir().join(RESULT_DIR).join(name)
+    artifact_dir().join(RESULT_DIR).join(name)
 }
 
 fn result_uri_for(root: Option<&str>) -> String {
@@ -538,7 +658,10 @@ fn result_uri_for(root: Option<&str>) -> String {
 /// pasta pode sumir no meio da sessão.
 fn ensure_result_dir(path: &Path) {
     if let Some(dir) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(dir) {
+        if dir.exists() {
+            return;
+        }
+        if let Err(e) = create_dir_restricted(dir, true) {
             log(format!("falha ao criar {}: {e}", dir.display()));
         }
     }
@@ -553,8 +676,13 @@ fn write_result(root: Option<&str>, content: &str) {
     let _guard = WRITE_LOCK.lock().unwrap();
     let path = result_path(root);
     ensure_result_dir(&path);
-    if let Err(e) = std::fs::write(&path, content) {
-        log(format!("falha ao escrever resultado em {}: {e}", path.display()));
+    match open_write_restricted(&path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(content.as_bytes()) {
+                log(format!("falha ao escrever resultado em {}: {e}", path.display()));
+            }
+        }
+        Err(e) => log(format!("falha ao abrir resultado em {}: {e}", path.display())),
     }
 }
 
@@ -717,6 +845,13 @@ fn show_message(sender: &Sender<Message>, typ: MessageType, message: impl Into<S
 // Execução da requisição (em thread separada)
 // ---------------------------------------------------------------------------
 
+/// Remove a query string de uma URL para registro/exibição. Os valores em
+/// `?a=b` costumam carregar tokens e identificadores, e o log fica legível a
+/// outros processos.
+fn url_no_query(url: &str) -> &str {
+    url.split_once('?').map(|(base, _)| base).unwrap_or(url)
+}
+
 fn format_response(
     code: u16,
     reason: &str,
@@ -778,14 +913,21 @@ fn perform_request(
 
     let body = req.body.as_ref().map(|b| {
         let resolved = resolve_vars(b, &file_vars, &dotenv, &responses);
-        expand_file_includes(&resolved, base_dir.as_deref(), &file_vars, &dotenv, &responses)
+        expand_file_includes(
+            &resolved,
+            base_dir.as_deref(),
+            root.as_deref().map(Path::new),
+            &file_vars,
+            &dotenv,
+            &responses,
+        )
     });
 
-    log(format!("=> {method} {url}"));
+    log(format!("=> {method} {}", url_no_query(&url)));
 
     // Indicador de progresso na barra de status, encerrado no fim desta função
     // (inclusive em caso de erro) pelo Drop.
-    let _progress = Progress::begin(sender, format!("Enviando {method} {url}"));
+    let _progress = Progress::begin(sender, format!("Enviando {method} {}", url_no_query(&url)));
 
     // Feedback imediato no painel de resultado: "Enviando…" no lugar da resposta
     // anterior. É o que dá para garantir — o Code Lens depende de o Zed re-pedir
@@ -882,6 +1024,15 @@ fn do_http(
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false) // queremos ver o corpo mesmo em 4xx/5xx
         .timeout_global(Some(Duration::from_secs(30)))
+        // Ao seguir um redirect, nunca reenvia o header `Authorization`: se o
+        // destino responder 3xx apontando para outro host, a credencial não vai
+        // junto. É o default do ureq, fixado aqui para não depender dele caso
+        // mude numa versão futura.
+        .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
+        // Limita a cadeia de redirects e, ao estourar o limite, devolve a última
+        // resposta (o 3xx) em vez de derrubar a requisição com um erro.
+        .max_redirects(10)
+        .max_redirects_will_error(false)
         .build();
     let agent: ureq::Agent = config.into();
 

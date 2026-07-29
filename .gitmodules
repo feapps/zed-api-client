@@ -1,0 +1,3 @@
+[submodule "grammars-src/tree-sitter-http"]
+	path = grammars-src/tree-sitter-http
+	url = https://github.com/feapps/tree-sitter-http
