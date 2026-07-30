@@ -194,6 +194,12 @@ struct State {
     inflight: HashSet<(String, u32)>,
     /// Raiz do workspace, para localizar o `.env`.
     root_path: Option<String>,
+    /// Se já pedimos ao Zed para abrir a aba de resultado nesta sessão.
+    ///
+    /// Contabilidade própria, de propósito: usar `docs` (didOpen/didClose do
+    /// cliente) para isso fazia o servidor repetir o `CreateFile` e o Zed abrir
+    /// uma **segunda aba** do mesmo arquivo. Ver [`perform_request`].
+    result_opened: bool,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -934,12 +940,27 @@ fn perform_request(
     // os lenses do .http de origem, coisa que ele deixa de fazer assim que o
     // buffer de resultado vira o editor ativo.
     let result_uri = result_uri_for(root.as_deref());
-    let was_open = state.lock().unwrap().docs.contains_key(&result_uri);
+    // A abertura da aba (`CreateFile`, que apaga e recria o arquivo) acontece no
+    // máximo uma vez por sessão. Perguntar a `docs` se o buffer está aberto não
+    // serve: o Zed manda `didClose` mesmo com a aba visível (aba de preview, o
+    // mesmo arquivo em dois painéis), e aí o clique seguinte repetia o
+    // `CreateFile` — e o Zed abria uma segunda aba do mesmo arquivo.
+    //
+    // Contrapartida assumida: se o usuário fechar a aba de resultado de
+    // propósito, as respostas seguintes continuam sendo escritas no arquivo, mas
+    // a aba não é reaberta sozinha (basta reabrir o arquivo). É preferível a
+    // duplicar abas, e não há como distinguir esse `didClose` do espúrio.
+    let needs_open = {
+        let mut guard = state.lock().unwrap();
+        let needs = !guard.result_opened;
+        guard.result_opened = true;
+        needs
+    };
     let placeholder = format!("# ⏳ Enviando…\n\n{method} {url}\n");
-    if was_open {
-        write_result(root.as_deref(), &placeholder);
-    } else {
+    if needs_open {
         open_result(sender, root.as_deref(), &placeholder);
+    } else {
+        write_result(root.as_deref(), &placeholder);
     }
 
     // Se sobrou algum {{...}} sem resolver, aborta com um erro claro em vez de
@@ -996,11 +1017,11 @@ fn perform_request(
     // reveal. Se fomos nós que acabamos de abrir a aba com o "Enviando…", o
     // buffer ainda pode estar sujo e o watcher ignoraria o disco — então a
     // resposta vai por applyEdit, que substitui o conteúdo de qualquer jeito.
-    log(format!("resultado was_open={was_open} ({result_uri})"));
-    if was_open {
-        write_result(root.as_deref(), &content);
-    } else {
+    log(format!("resultado needs_open={needs_open} ({result_uri})"));
+    if needs_open {
         edit_result(sender, root.as_deref(), &content);
+    } else {
+        write_result(root.as_deref(), &content);
     }
 
     // Limpa o loading e atualiza os Code Lens. O resultado já está escrito, então
