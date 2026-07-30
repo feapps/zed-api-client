@@ -118,6 +118,28 @@ resultado é aberta via `workspace/applyEdit` e nasce "suja" (não salva); o
 autosave a deixa limpa, e é isso que permite que as respostas seguintes sejam
 atualizadas em disco sem roubar o foco do editor.
 
+### Se a instalação falhar em `failed to compile grammar 'http'`
+
+O Zed mantém um checkout do grammar em `grammars/` (gerado por ele, ignorado no
+git) e **se recusa a reaproveitá-lo quando o `repository` do `extension.toml`
+mudou**, com esta mensagem:
+
+```
+grammar directory '.../grammars/http' already exists,
+but is not a git clone of 'https://github.com/feapps/tree-sitter-http'
+```
+
+É o caso de quem instalou a extensão quando o `[grammars.http] repository`
+apontava para um caminho local. Como `grammars/` é artefato regenerável, apague
+e instale de novo:
+
+```sh
+rm -rf grammars/
+```
+
+O Zed clona o grammar do zero na próxima instalação. Vale o mesmo sempre que
+`repository` ou `rev` mudarem.
+
 ### Como o binário do language server é encontrado
 
 A extensão WASM ([`src/lib.rs`](./src/lib.rs)) resolve o binário na seguinte
