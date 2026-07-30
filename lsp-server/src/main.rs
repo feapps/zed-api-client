@@ -189,7 +189,15 @@ struct State {
     docs: HashMap<String, String>,
     /// Última resposta por nome de requisição, usada para encadeamento
     /// `{{nome.response.body.campo}}` e `{{nome.response.headers.Header}}`.
-    responses: HashMap<String, StoredResponse>,
+    ///
+    /// Agrupada por "ambiente" (pasta do arquivo `.http`) → nome da requisição.
+    /// Sem esse agrupamento, um `# @name login` em `.rest/hml/api.http` e outro
+    /// em `.rest/prd/api.http` dividiam a mesma chave: autenticar num ambiente
+    /// derrubava o token do outro. A pasta é o mesmo critério usado para achar o
+    /// `.env` (ver [`load_dotenv`]), então "ambiente" quer dizer a mesma coisa
+    /// nos dois lugares — e arquivos `.http` da mesma pasta continuam podendo
+    /// encadear entre si.
+    responses: HashMap<String, HashMap<String, StoredResponse>>,
     /// Requisições em andamento (uri, linha) — para o indicador de loading.
     inflight: HashSet<(String, u32)>,
     /// Raiz do workspace, para localizar o `.env`.
@@ -851,6 +859,18 @@ fn show_message(sender: &Sender<Message>, typ: MessageType, message: impl Into<S
 // Execução da requisição (em thread separada)
 // ---------------------------------------------------------------------------
 
+/// Chave do "ambiente" que isola as respostas guardadas: a pasta do arquivo
+/// `.http`. Assim `.rest/hml/api.http` e `.rest/prd/api.http` têm tokens
+/// independentes, enquanto dois `.http` da mesma pasta compartilham.
+///
+/// Sem pasta (documento sem caminho em disco), usa a própria uri — pior caso é
+/// não compartilhar com ninguém, nunca vazar de um ambiente para outro.
+fn response_scope(uri: &str, base_dir: Option<&Path>) -> String {
+    base_dir
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|| uri.to_string())
+}
+
 /// Remove a query string de uma URL para registro/exibição. Os valores em
 /// `?a=b` costumam carregar tokens e identificadores, e o log fica legível a
 /// outros processos.
@@ -894,8 +914,25 @@ fn perform_request(
     // Quando o `⏳ Enviando…` foi pedido, para respeitar MIN_LOADING.
     loading_since: Instant,
 ) {
-    // Snapshot das respostas anteriores (para encadeamento) sem segurar o lock.
-    let responses = state.lock().unwrap().responses.clone();
+    // Diretório do arquivo .http. Serve para duas coisas: base dos includes
+    // `< caminho/relativo` e chave do "ambiente" que isola as respostas.
+    let base_dir = uri
+        .strip_prefix("file://")
+        .map(Path::new)
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .or_else(|| root.as_deref().map(PathBuf::from));
+    let scope = response_scope(&uri, base_dir.as_deref());
+
+    // Snapshot das respostas do MESMO ambiente (para encadeamento), sem segurar
+    // o lock. Respostas de outros ambientes ficam invisíveis aqui de propósito.
+    let responses = state
+        .lock()
+        .unwrap()
+        .responses
+        .get(&scope)
+        .cloned()
+        .unwrap_or_default();
 
     let method = resolve_vars(&req.method, &file_vars, &dotenv, &responses);
     let url = resolve_vars(&req.url, &file_vars, &dotenv, &responses);
@@ -909,14 +946,6 @@ fn perform_request(
             )
         })
         .collect();
-    // Diretório do arquivo .http, base para includes `< caminho/relativo`.
-    let base_dir = uri
-        .strip_prefix("file://")
-        .map(Path::new)
-        .and_then(|p| p.parent())
-        .map(|p| p.to_path_buf())
-        .or_else(|| root.as_deref().map(PathBuf::from));
-
     let body = req.body.as_ref().map(|b| {
         let resolved = resolve_vars(b, &file_vars, &dotenv, &responses);
         expand_file_includes(
@@ -1002,7 +1031,13 @@ fn perform_request(
                         body,
                         headers: resp_headers.clone(),
                     };
-                    state.lock().unwrap().responses.insert(name.clone(), stored);
+                    state
+                        .lock()
+                        .unwrap()
+                        .responses
+                        .entry(scope.clone())
+                        .or_default()
+                        .insert(name.clone(), stored);
                 }
                 format_response(code, &reason, &resp_headers, &resp_body, &content_type)
             }

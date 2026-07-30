@@ -208,10 +208,19 @@ Se nenhuma das quatro funcionar, o Zed mostra o motivo da falha.
     cache de respostas da sessão atual (em memória; some ao reiniciar o
     language server), em três formas:
     - `{{nome.response.body.caminho}}` — navega o JSON do corpo
-      (ex.: `{{oauthLogin.response.body.access_token}}`);
+      (ex.: `{{login.response.body.json.key}}`);
     - `{{nome.response.headers.Header}}` — valor de um cabeçalho da resposta
-      (match case-insensitive, ex.: `{{oauthLogin.response.headers.content-type}}`);
+      (match case-insensitive, ex.: `{{login.response.headers.content-type}}`);
     - `{{nome.response.status}}` — código de status HTTP (ex.: `200`).
+
+    Esse cache é **por ambiente**, sendo o ambiente a pasta do arquivo `.http` —
+    o mesmo critério usado para achar o `.env`. Então um `# @name login` em
+    `.rest/hml/api.http` e outro em `.rest/prd/api.http` guardam tokens
+    independentes: autenticar num ambiente não derruba a sessão do outro. Dois
+    arquivos `.http` na **mesma** pasta continuam compartilhando as respostas,
+    o que permite separar (por exemplo) `login.http` e `pedidos.http` sem
+    precisar repetir o login. Consequência: mover um `.http` para outra pasta
+    zera o encadeamento dele, porque mudou de ambiente.
   - inclusão de arquivo no corpo (estilo REST Client):
     - `< caminho` insere o conteúdo do arquivo cru (caminho relativo ao `.http`);
     - `<@ caminho` insere o conteúdo e resolve `{{...}}` dentro dele.
