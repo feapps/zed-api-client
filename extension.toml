@@ -1,6 +1,6 @@
 id = "http-request-client"
 name = "HTTP Request Client"
-version = "0.1.1"
+version = "0.1.2"
 schema_version = 1
 authors = ["Einstein Adriano <einstein@feap.io>"]
 description = "Destaque de sintaxe e execução de requisições para arquivos .http e .rest"
