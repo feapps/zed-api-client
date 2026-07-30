@@ -292,7 +292,7 @@ Se nenhuma das quatro funcionar, o Zed mostra o motivo da falha.
 
 A gramática `tree-sitter-http` reconhece interpolações no formato
 `{{identificador}}` (sem espaço) — cobre bem casos como
-`{{oauthLogin.response.body.access_token}}`. Já variáveis de processador com
+`{{login.response.body.json.key}}`. Já variáveis de processador com
 argumento e espaço, como `{{$dotenv HOST}}`, não são reconhecidas como o nó
 `variable` e por isso não recebem o destaque de colchetes/identificador;
 o texto continua correto e funcional, só não fica colorido como variável.
@@ -306,15 +306,16 @@ da gramática é fraca, um único caso desses gera um nó de erro que se propaga
 "apaga" as cores de tudo que vem depois no arquivo. Exemplo que quebra:
 
 ```http
-# @name backupMade
-POST {{HOST}}/v1/backup
+# @name updateExample
+PUT {{HOST}}/put
 content-type: {{CONTENT_TYPE}}
 
 {
-  "model_name": "receivable_units"
+  "name": "novo nome",
+  "active": true
 }
 
-# model_name: nome da tabela   <- comentário após o body: quebra o highlight
+# active: liga/desliga o registro   <- comentário após o body: quebra o highlight
 ###
 ```
 
@@ -322,13 +323,14 @@ Workaround: colocar os comentários de documentação **antes** do body (junto a
 cabeçalhos, onde a gramática os aceita):
 
 ```http
-# @name backupMade
-# model_name: nome da tabela   <- comentário antes do body: OK
-POST {{HOST}}/v1/backup
+# @name updateExample
+# active: liga/desliga o registro   <- comentário antes do body: OK
+PUT {{HOST}}/put
 content-type: {{CONTENT_TYPE}}
 
 {
-  "model_name": "receivable_units"
+  "name": "novo nome",
+  "active": true
 }
 ###
 ```
