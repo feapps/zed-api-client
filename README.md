@@ -26,9 +26,9 @@ prioridade. O `.env` em si não é versionado (ver [`.gitignore`](./.gitignore))
 - [x] Exibição do resultado (status line + headers + body formatado) em uma aba
       ao lado
 - [x] Resolução do binário do language server (settings do Zed → build local do
-      repositório → `$PATH`)
-- [ ] Distribuição: baixar o binário do release do GitHub em vez de exigir
-      `cargo install` (ver `src/lib.rs`)
+      repositório → `$PATH` → download do release)
+- [x] Distribuição: baixa o binário do GitHub Release automaticamente, sem
+      exigir `cargo install` (ver `src/lib.rs`)
 
 ### Destaque de sintaxe
 
@@ -101,8 +101,10 @@ trabalho — parse, resolução de variáveis e as requisições HTTP).
 ## Como testar localmente no Zed
 
 1. Compile o language server: `cargo build -p http_request_client_lsp`.
-   Para usar a extensão em **outros** projetos, instale-o no `$PATH`:
-   `cargo install --path lsp-server`.
+   Para usar a extensão em **outros** projetos a partir deste checkout, instale-o
+   no `$PATH`: `cargo install --path lsp-server`. (Quem instala a extensão pela
+   loja do Zed não precisa disso — o binário é baixado do release; ver
+   [Como o binário do language server é encontrado](#como-o-binário-do-language-server-é-encontrado).)
 2. Habilite os Code Lens no `settings.json` do Zed: `"code_lens": "on"`.
 3. Abra o Zed **por um terminal que tenha o `cargo` no `PATH`** — o Zed herda o
    ambiente de quem o iniciou e precisa dele para compilar a dev extension.
@@ -137,9 +139,20 @@ ordem, da fonte mais explícita para a mais automática:
    quando é ele que está aberto no Zed — assim o ciclo de desenvolvimento
    (`cargo build` → reiniciar o language server) funciona sem instalar nada;
 3. o `$PATH`, via `worktree.which(...)` — é o caso ao usar a extensão em outros
-   projetos, depois de `cargo install --path lsp-server`.
+   projetos, depois de `cargo install --path lsp-server`;
+4. o binário publicado no **GitHub Release** do repositório, baixado
+   automaticamente para a plataforma atual — é o caminho de quem instala a
+   extensão pela loja do Zed, sem precisar de Rust nem `cargo` na máquina.
 
-Se nenhuma das três funcionar, o Zed mostra uma mensagem com essas opções.
+O download do passo 4 usa o asset
+`http-request-client-lsp-<os>-<arch>.gz` do último release (`os` ∈
+`macos`/`linux`/`windows`, `arch` ∈ `aarch64`/`x86_64`/`x86`), publicado pelo
+workflow [`.github/workflows/release.yml`](./.github/workflows/release.yml). O
+binário é guardado num diretório versionado, reaproveitado nas execuções
+seguintes, e versões antigas são removidas. O progresso aparece na UI do Zed
+como status de instalação do language server.
+
+Se nenhuma das quatro funcionar, o Zed mostra o motivo da falha.
 
 ## Funcionalidade "Send request"
 
@@ -202,6 +215,13 @@ Se nenhuma das três funcionar, o Zed mostra uma mensagem com essas opções.
   - inclusão de arquivo no corpo (estilo REST Client):
     - `< caminho` insere o conteúdo do arquivo cru (caminho relativo ao `.http`);
     - `<@ caminho` insere o conteúdo e resolve `{{...}}` dentro dele.
+
+    Por segurança, a leitura é **confinada à raiz do workspace**: o caminho é
+    canonicalizado (resolvendo `..` e symlinks) e recusado se escapar dela.
+    Sem isso, um `.http` de origem não confiável poderia incluir
+    `~/.ssh/id_rsa` e enviar o conteúdo para um servidor arbitrário com um
+    clique. Inclusões bloqueadas ficam registradas no log e a linha `< ...`
+    é mantida literal no corpo.
   - se sobrar algum `{{...}}` sem resolver, a requisição **não** é enviada: o
     resultado traz a lista das variáveis faltantes, em vez de um erro obscuro
     do cliente HTTP.
@@ -225,14 +245,14 @@ Se nenhuma das três funcionar, o Zed mostra uma mensagem com essas opções.
     mais (abas de preview, o mesmo arquivo em dois painéis) deixaria a aba muda
     até ser reaberta.
 
-  O log fica em `/tmp/http-request-client-lsp-<nome-do-workspace>.log` — um por
-  projeto, porque o Zed sobe um language server por projeto aberto e com um
-  caminho fixo os logs se misturavam. Ele registra uma linha
+  O log fica em `<dir-privado>/http-request-client-lsp-<nome-do-workspace>.log`
+  — um por projeto, porque o Zed sobe um language server por projeto aberto e
+  com um caminho fixo os logs se misturavam. Ele registra uma linha
   `-> codeLens <uri>: N lens, M enviando` por requisição de lens, útil para
   diferenciar "o servidor não respondeu" de "o cliente não pediu", e para ver
   se o `⏳` chegou a ser servido.
 - O resultado é formatado como status line + cabeçalhos + corpo (pretty-print
-  quando JSON) e escrito em `/tmp/requests/<nome-do-workspace>.http`:
+  quando JSON) e escrito em `<dir-privado>/requests/<nome-do-workspace>.http`:
 
   ```
   HTTP/1.1 200 OK
@@ -251,14 +271,22 @@ Se nenhuma das três funcionar, o Zed mostra uma mensagem com essas opções.
   (a única forma de o Zed abrir uma aba a pedido do language server, já que ele
   não implementa `window/showDocument`).
 
-  O arquivo fica **fora do projeto**, em `/tmp/requests/` (a pasta é criada
-  quando não existe), com o nome do workspace — assim ele não suja o repositório
-  nem precisa de `.gitignore`, e dois projetos abertos ao mesmo tempo não
-  disputam o mesmo arquivo. Estar fora do worktree não atrapalha: testei, e o
-  Zed cria um worktree invisível de arquivo único para ele, registra o language
-  server nele e observa o arquivo normalmente — a escrita em disco gera
-  `didChange` como antes. Consequência esperada de morar em `/tmp`: as respostas
-  não sobrevivem a um boot.
+  O arquivo fica **fora do projeto**, com o nome do workspace — assim ele não
+  suja o repositório nem precisa de `.gitignore`, e dois projetos abertos ao
+  mesmo tempo não disputam o mesmo arquivo. Estar fora do worktree não
+  atrapalha: testei, e o Zed cria um worktree invisível de arquivo único para
+  ele, registra o language server nele e observa o arquivo normalmente — a
+  escrita em disco gera `didChange` como antes. Consequência esperada de morar
+  no diretório temporário: as respostas não sobrevivem a um boot.
+
+  O `<dir-privado>` é criado dentro do diretório temporário do sistema como
+  `http-request-client-<aleatório>`, com permissão `0700` (e os arquivos com
+  `0600`). Respostas de API costumam trazer tokens e dados sensíveis, e o
+  diretório temporário é compartilhado: com um caminho fixo e permissão padrão,
+  qualquer outro usuário (ou serviço) da máquina conseguiria **ler** as
+  respostas, ou plantar um symlink no caminho previsível para **desviar** a
+  escrita. O nome aleatório e o `0700` fecham os dois. As URLs registradas no
+  log também vão **sem query string**, que é onde tokens costumam viajar.
 
 ### Limitação conhecida (destaque de sintaxe)
 
