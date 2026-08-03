@@ -113,10 +113,12 @@ trabalho — parse, resolução de variáveis e as requisições HTTP).
    sintaxe é aplicado e o botão "▶ Send request" aparece acima de cada
    requisição.
 
-Recomendado: `"autosave": "on_focus_change"` no `settings.json`. A aba de
-resultado é aberta via `workspace/applyEdit` e nasce "suja" (não salva); o
-autosave a deixa limpa, e é isso que permite que as respostas seguintes sejam
-atualizadas em disco sem roubar o foco do editor.
+Recomendado: `"autosave": "on_focus_change"` no `settings.json`. Ele só é
+necessário no caminho de fallback (clientes que não tratam
+`window/showDocument`), em que a aba de resultado é aberta via
+`workspace/applyEdit` e nasce "suja" (não salva): o autosave a deixa limpa, e é
+isso que permite que as respostas seguintes sejam atualizadas em disco sem roubar
+o foco do editor.
 
 ### Se a instalação falhar em `failed to compile grammar 'http'`
 
@@ -214,10 +216,10 @@ Se nenhuma das quatro funcionar, o Zed mostra o motivo da falha.
   em vez de enfileirá-lo — então, numa requisição de poucos ms, o refresh do
   fim cancelava o do começo. A espera só atrasa o botão voltar ao normal: a
   resposta já foi escrita antes dela.
-- A resposta é entregue por escrita em disco quando o painel de resultado já
-  estava aberto antes da requisição, e por `applyEdit` quando foi o próprio
-  `⏳ Enviando…` que abriu a aba — nesse caso o buffer ainda pode estar "sujo",
-  e o watcher do Zed ignoraria a escrita em disco.
+- A resposta é sempre escrita em disco; se o cliente não tem o buffer aberto,
+  um `window/showDocument` (sem roubar o foco) mostra a aba. No fallback por
+  `applyEdit`, a primeira resposta vai pelo próprio edit — nesse caminho o buffer
+  ainda pode estar "sujo", e o watcher do Zed ignoraria a escrita em disco.
 - A requisição é resolvida e executada pelo `lsp-server` nativo (não pela
   extensão WASM, que não tem acesso à rede):
   - variáveis `{{NOME}}` são resolvidas a partir de declarações `@NOME = valor`
@@ -227,8 +229,8 @@ Se nenhuma das quatro funcionar, o Zed mostra o motivo da falha.
     raiz do workspace — o mais próximo tem prioridade, o que permite um `.env`
     por ambiente (ex.: `.rest/prd/.env`);
   - referências encadeadas a respostas anteriores são resolvidas a partir do
-    cache de respostas da sessão atual (em memória; some ao reiniciar o
-    language server), em três formas:
+    cache de respostas, que é **persistido** em
+    `<dir-privado>/responses.json` (`0600`), em três formas:
     - `{{nome.response.body.caminho}}` — navega o JSON do corpo
       (ex.: `{{login.response.body.json.key}}`);
     - `{{nome.response.headers.Header}}` — valor de um cabeçalho da resposta
@@ -243,6 +245,34 @@ Se nenhuma das quatro funcionar, o Zed mostra o motivo da falha.
     o que permite separar (por exemplo) `login.http` e `pedidos.http` sem
     precisar repetir o login. Consequência: mover um `.http` para outra pasta
     zera o encadeamento dele, porque mudou de ambiente.
+
+    O cache é persistido porque o Zed **para e sobe o language server no meio da
+    sessão** (derruba quando o último `.http` fecha, e também reinicia sozinho com
+    arquivos abertos — dá para ver no log um `=== starting ===` sem nenhum
+    `didClose` antes). Enquanto ele vivia só em memória, esse ciclo — invisível
+    para quem está usando — apagava o token do `# @name oauthLogin`, e as
+    requisições seguintes falhavam com "variáveis não resolvidas" sem nada na tela
+    explicando por quê.
+
+    **Fechar um `.http` apaga as respostas guardadas dele** (memória e disco), com
+    três ressalvas que existem para não apagar o que ainda está em uso:
+
+    - o ambiente é a *pasta*, então ele só é limpo quando **nenhum outro `.http`
+      aberto** o compartilha — fechar `login.http` não derruba a sessão do
+      `pedidos.http` aberto ao lado;
+    - a limpeza espera 3 s (`CLOSE_GRACE`) e é cancelada se o arquivo voltar
+      (`didOpen`) ou der sinal de vida (um pedido de Code Lens) nesse intervalo —
+      é o filtro para o `didClose` espúrio do Zed;
+    - um reinício do servidor **sem** `didClose` não apaga nada: só o que estava
+      pendente de limpeza é descartado no encerramento (`flush_pending_clears`).
+
+    Consequência assumida: fechar todos os `.http` e reabrir depois exige refazer
+    o login. Respostas maiores que 512 KiB (`MAX_RESPONSE_ENTRY_BYTES`) ficam só em
+    memória — dá para encadear com elas na sessão, mas elas não vão para o disco,
+    para uma listagem de 2 MB não impedir o token de 700 bytes de ser salvo (era o
+    que acontecia com um teto só no total: `respostas não persistidas` no log e
+    nada era gravado). Quando não sobra nenhuma resposta, o `responses.json` é
+    removido.
   - inclusão de arquivo no corpo (estilo REST Client):
     - `< caminho` insere o conteúdo do arquivo cru (caminho relativo ao `.http`);
     - `<@ caminho` insere o conteúdo e resolve `{{...}}` dentro dele.
@@ -260,8 +290,9 @@ Se nenhuma das quatro funcionar, o Zed mostra o motivo da falha.
   linhas (linhas iniciadas por `?` ou `&`), comentários entre os cabeçalhos,
   parâmetros de query comentados e comentários depois do corpo (que não entram
   no corpo enviado).
-- Com **vários `.http` abertos ao mesmo tempo**, todos mostram os lenses. Duas
-  defesas no servidor garantem isso, porque o cliente é a parte frágil aqui:
+- Com **vários `.http` abertos ao mesmo tempo**, todos mostram os lenses — e os
+  botões continuam funcionando depois de editar os arquivos. Quatro defesas no
+  servidor garantem isso, porque o cliente é a parte frágil aqui:
   - quem desenha os lenses é o *editor*, e ele só busca os buffers já
     registrados e visíveis nele. Duas corridas fazem essa busca cair no vazio,
     sem nada reagendá-la depois: abrir um segundo `.http` (a busca chega antes
@@ -274,7 +305,41 @@ Se nenhuma das quatro funcionar, o Zed mostra o motivo da falha.
   - os lenses não dependem do bookkeeping de `didOpen`/`didClose`: se o texto de
     um documento não estiver em memória, ele é lido do disco. Um `didClose` a
     mais (abas de preview, o mesmo arquivo em dois painéis) deixaria a aba muda
-    até ser reaberta.
+    até ser reaberta;
+  - o clique não confia em nenhum argumento isolado do lens. O cliente **congela
+    os argumentos do comando** quando recebe o lens e ancora só a posição na tela,
+    e não os troca nem depois de receber os lenses de novo — medido: 104 lenses
+    novos entregues a cada `didChange` e o clique seguinte ainda chegou com os
+    argumentos antigos. O sintoma era o pior de todos: o botão simplesmente não
+    surtia efeito, e só fechar e reabrir o `.http` resolvia. Por isso o lens leva
+    **quatro pistas**, e `resolve_request` as testa da mais estável para a mais
+    frágil, porque cada uma morre com um tipo diferente de edição:
+
+    | pista | sobrevive a | morre com |
+    | --- | --- | --- |
+    | `# @name` | qualquer mudança na URL | renomear a requisição |
+    | identidade (método + URL + nome) | deslocamento de linhas | qualquer edição no texto da requisição |
+    | linha | edição *dentro* da requisição | inserir/remover linhas acima |
+    | método | — | corrobora a linha |
+
+    As duas primeiras versões erraram justamente aqui. A primeira mandava só a
+    linha (`requisição na linha 1336 não encontrada`, com a requisição em 1330).
+    A segunda deu à identidade prioridade sobre a linha — e aí ligar um
+    `&page_size=100` na query multilinha passou a invalidar o botão para sempre:
+    `requisição não encontrada em ...:163 (key=Some(10878242406106393856))`, com a
+    linha 163 ainda **certa**. Nome antes de identidade antes de linha resolve os
+    dois, e o método impede o único risco real de cair na linha (linhas que
+    andaram fariam disparar a requisição errada — são chamadas de API de verdade).
+    Sem nenhuma casar, o servidor **avisa** em vez de ficar mudo, e a mensagem
+    manda fechar e reabrir o arquivo, porque o refresh não desfaz o congelamento;
+  - o servidor só pede `codeLens/refresh` numa edição quando ela mexeu na
+    **posição ou no nome** de alguma requisição (`lens_signature`). O refresh é
+    global: ele invalida os lenses de *todos* os buffers, mas o Zed só re-pede os
+    dos editores que considera visíveis — um `.http` escondido atrás da aba de
+    resposta, ou em outro painel, ficava sem nenhum lens até ser reaberto. Pedir
+    refresh a cada tecla digitada, como antes, fazia o "▶ Send request"
+    desaparecer depois de um tempo de uso; digitar dentro de um corpo JSON agora
+    não invalida nada.
 
   O log fica em `<dir-privado>/http-request-client-lsp-<nome-do-workspace>.log`
   — um por projeto, porque o Zed sobe um language server por projeto aberto e
@@ -296,11 +361,25 @@ Se nenhuma das quatro funcionar, o Zed mostra o motivo da falha.
   }
   ```
 
-  Se o arquivo já estiver aberto, ele é atualizado em disco e o file watcher do
-  Zed recarrega o buffer — sem roubar o foco, o que permite deixá-lo num split
-  ao lado do `.http`. Se estiver fechado, é aberto via `workspace/applyEdit`
-  (a única forma de o Zed abrir uma aba a pedido do language server, já que ele
-  não implementa `window/showDocument`).
+  O buffer é atualizado em disco e o file watcher do Zed recarrega — sem roubar
+  o foco, o que permite deixá-lo num split ao lado do `.http`. Quando o cliente
+  não tem o arquivo aberto, ele é mostrado com `window/showDocument`
+  (`takeFocus: false`), que é idempotente: não duplica aba, não deixa o buffer
+  sujo e reabre a aba se ela tiver sido fechada.
+
+  O Zed **não implementa** `window/showDocument` (medido em 2026-08-03: responde
+  `-32601 Unrecognized method`, e nem anuncia a capability), então hoje quem roda
+  na prática é o fallback abaixo; o caminho preferido fica pronto para quando ele
+  passar a implementar. Se o cliente recusar o `window/showDocument`, responder
+  com erro **ou não responder** em 3 s, o servidor passa a usar o mecanismo
+  anterior —
+  `workspace/applyEdit` com um `CreateFile`, uma vez por sessão — e entrega a
+  resposta daquela requisição por lá também. Esse caminho existe porque
+  `applyEdit` era, até aqui, a única forma conhecida de fazer o Zed abrir uma aba
+  a pedido do language server; ele tem duas contrapartidas que o `showDocument`
+  não tem: o `didClose` espúrio do Zed (aba de preview, o mesmo arquivo em dois
+  painéis) obriga a escolher entre **duplicar a aba** e **escrever a resposta num
+  arquivo invisível**, e o buffer nasce sujo (daí a recomendação de autosave).
 
   O arquivo fica **fora do projeto**, com o nome do workspace — assim ele não
   suja o repositório nem precisa de `.gitignore`, e dois projetos abertos ao
@@ -310,14 +389,25 @@ Se nenhuma das quatro funcionar, o Zed mostra o motivo da falha.
   escrita em disco gera `didChange` como antes. Consequência esperada de morar
   no diretório temporário: as respostas não sobrevivem a um boot.
 
-  O `<dir-privado>` é criado dentro do diretório temporário do sistema como
-  `http-request-client-<aleatório>`, com permissão `0700` (e os arquivos com
-  `0600`). Respostas de API costumam trazer tokens e dados sensíveis, e o
-  diretório temporário é compartilhado: com um caminho fixo e permissão padrão,
-  qualquer outro usuário (ou serviço) da máquina conseguiria **ler** as
-  respostas, ou plantar um symlink no caminho previsível para **desviar** a
-  escrita. O nome aleatório e o `0700` fecham os dois. As URLs registradas no
-  log também vão **sem query string**, que é onde tokens costumam viajar.
+  O `<dir-privado>` é
+  `<temp>/http-request-client-<uid>/<nome-do-workspace>-<hash-da-raiz>/`, com
+  permissão `0700` (e os arquivos com `0600`). Respostas de API costumam trazer
+  tokens e dados sensíveis, e o diretório temporário é compartilhado: com um
+  caminho fixo e permissão padrão, qualquer outro usuário (ou serviço) da máquina
+  conseguiria **ler** as respostas, ou plantar um symlink no caminho previsível
+  para **desviar** a escrita. O diretório de cima é criado em modo exclusivo e,
+  se já existir, só é reaproveitado depois de conferir que é um diretório (não um
+  symlink), com `0700` e do nosso uid — senão o servidor cai num nome aleatório.
+  Como ninguém mais atravessa esse diretório, o subdiretório do workspace pode
+  ter nome previsível. As URLs registradas no log também vão **sem query
+  string**, que é onde tokens costumam viajar.
+
+  O caminho é **estável**: depende do usuário e da raiz do workspace, não do
+  processo. Ele já foi aleatório por processo, e isso era um bug — como o Zed
+  derruba e sobe o language server ao longo da sessão, cada ciclo estreava um
+  caminho de resultado, o Zed abria **mais uma aba de resposta** e as antigas
+  ficavam órfãs (era assim que apareciam dezenas de `/tmp/http-request-client-*`
+  numa tarde de uso).
 
 ### Limitação conhecida (destaque de sintaxe)
 
