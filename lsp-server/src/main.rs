@@ -493,7 +493,7 @@ fn load_responses() -> Responses {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(r) => r,
             Err(e) => {
-                log(format!("ignorando {} (não pôde ser lido): {e}", path.display()));
+                log(format!("ignoring {} (could not be read): {e}", path.display()));
                 Responses::default()
             }
         },
@@ -538,13 +538,13 @@ fn clear_responses_for(state: &Shared, uri: &str) {
             .find(|other| *other != uri && doc_scope(other, root.as_deref()) == scope)
             .cloned();
         if let Some(other) = shared_with {
-            log(format!("respostas de {scope} mantidas: {other} continua aberto"));
+            log(format!("responses for {scope} kept: {other} is still open"));
             return;
         }
         if guard.responses.remove(&scope).is_none() {
             return;
         }
-        log(format!("respostas de {scope} apagadas ({uri} fechado)"));
+        log(format!("responses for {scope} cleared ({uri} closed)"));
         guard.responses.clone()
     };
     save_responses(&snapshot);
@@ -573,7 +573,7 @@ fn save_responses(responses: &Responses) {
         let _guard = lock_writes();
         if path.exists() {
             if let Err(e) = std::fs::remove_file(&path) {
-                log(format!("falha ao remover {}: {e}", path.display()));
+                log(format!("failed to remove {}: {e}", path.display()));
             }
         }
         return;
@@ -597,7 +597,7 @@ fn save_responses(responses: &Responses) {
     }
     if !skipped.is_empty() {
         log(format!(
-            "respostas grandes ficam só em memória: {}",
+            "large responses kept in memory only: {}",
             skipped.join(", ")
         ));
     }
@@ -607,7 +607,7 @@ fn save_responses(responses: &Responses) {
     };
     if json.len() > MAX_RESPONSES_BYTES {
         log(format!(
-            "respostas não persistidas: {} bytes passam do teto de {MAX_RESPONSES_BYTES}",
+            "responses not persisted: {} bytes exceed the cap of {MAX_RESPONSES_BYTES}",
             json.len()
         ));
         return;
@@ -616,10 +616,10 @@ fn save_responses(responses: &Responses) {
     match open_write_restricted(&path) {
         Ok(mut f) => {
             if let Err(e) = f.write_all(&json) {
-                log(format!("falha ao escrever {}: {e}", path.display()));
+                log(format!("failed to write {}: {e}", path.display()));
             }
         }
-        Err(e) => log(format!("falha ao abrir {}: {e}", path.display())),
+        Err(e) => log(format!("failed to open {}: {e}", path.display())),
     }
 }
 
@@ -935,7 +935,7 @@ fn read_include(base_dir: Option<&Path>, root: Option<&Path>, path: &str) -> Opt
     let full = match full.canonicalize() {
         Ok(f) => f,
         Err(e) => {
-            log(format!("falha ao incluir arquivo {}: {e}", full.display()));
+            log(format!("failed to include file {}: {e}", full.display()));
             return None;
         }
     };
@@ -944,7 +944,7 @@ fn read_include(base_dir: Option<&Path>, root: Option<&Path>, path: &str) -> Opt
         Some(b) if full.starts_with(&b) => {}
         Some(b) => {
             log(format!(
-                "inclusão bloqueada: {} está fora de {}",
+                "include blocked: {} is outside {}",
                 full.display(),
                 b.display()
             ));
@@ -952,7 +952,7 @@ fn read_include(base_dir: Option<&Path>, root: Option<&Path>, path: &str) -> Opt
         }
         None => {
             log(format!(
-                "inclusão bloqueada: sem limite de workspace para validar {}",
+                "include blocked: no workspace boundary to validate {}",
                 full.display()
             ));
             return None;
@@ -961,7 +961,7 @@ fn read_include(base_dir: Option<&Path>, root: Option<&Path>, path: &str) -> Opt
     match std::fs::read(&full) {
         Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
         Err(e) => {
-            log(format!("falha ao incluir arquivo {}: {e}", full.display()));
+            log(format!("failed to include file {}: {e}", full.display()));
             None
         }
     }
@@ -1084,7 +1084,7 @@ fn ensure_result_dir(path: &Path) {
             return;
         }
         if let Err(e) = create_dir_restricted(dir, true) {
-            log(format!("falha ao criar {}: {e}", dir.display()));
+            log(format!("failed to create {}: {e}", dir.display()));
         }
     }
 }
@@ -1101,10 +1101,10 @@ fn write_result(root: Option<&str>, content: &str) {
     match open_write_restricted(&path) {
         Ok(mut f) => {
             if let Err(e) = f.write_all(content.as_bytes()) {
-                log(format!("falha ao escrever resultado em {}: {e}", path.display()));
+                log(format!("failed to write result to {}: {e}", path.display()));
             }
         }
-        Err(e) => log(format!("falha ao abrir resultado em {}: {e}", path.display())),
+        Err(e) => log(format!("failed to open result at {}: {e}", path.display())),
     }
 }
 
@@ -1179,7 +1179,7 @@ fn publish_result(state: &Shared, sender: &Sender<Message>, root: Option<&str>, 
 fn show_result(state: &Shared, sender: &Sender<Message>, root: Option<&str>) {
     let uri_str = result_uri_for(root);
     let Ok(uri) = Uri::from_str(&uri_str) else {
-        log(format!("uri de resultado inválida: {uri_str}"));
+        log(format!("invalid result uri: {uri_str}"));
         return;
     };
     let params = ShowDocumentParams {
@@ -1212,7 +1212,7 @@ fn show_result(state: &Shared, sender: &Sender<Message>, root: Option<&str>) {
             guard.pending_show.remove(&id) && !guard.result_open
         };
         if give_up {
-            log("window/showDocument sem resposta; usando applyEdit + CreateFile");
+            log("window/showDocument got no answer; using applyEdit + CreateFile");
             fall_back_to_apply_edit(&state, &sender, root.as_deref());
         }
     });
@@ -1237,7 +1237,7 @@ fn edit_result(sender: &Sender<Message>, root: Option<&str>, content: &str) {
 fn apply_result_edit(sender: &Sender<Message>, root: Option<&str>, content: &str, create: bool) {
     let uri_str = result_uri_for(root);
     let Ok(uri) = Uri::from_str(&uri_str) else {
-        log(format!("uri de resultado inválida: {uri_str}"));
+        log(format!("invalid result uri: {uri_str}"));
         return;
     };
     let mut ops = Vec::new();
@@ -1588,11 +1588,11 @@ fn perform_request(
 
     let (timeout, timeout_from) = resolve_timeout(&req, &dotenv);
     log(format!(
-        "=> {method} {} (timeout {}, de {timeout_from})",
+        "=> {method} {} (timeout {}, from {timeout_from})",
         url_no_query(&url),
         match timeout {
             Some(d) => format!("{}s", d.as_secs()),
-            None => "sem limite".to_string(),
+            None => "no limit".to_string(),
         }
     ));
 
@@ -1621,7 +1621,7 @@ fn perform_request(
     }
 
     let content = if !unresolved.is_empty() {
-        log(format!("variáveis não resolvidas: {unresolved:?}"));
+        log(format!("unresolved variables: {unresolved:?}"));
         let list = unresolved
             .iter()
             .map(|t| format!("  - {}{}{}", "{{", t, "}}"))
@@ -1666,7 +1666,7 @@ fn perform_request(
             Err(e) => {
                 let elapsed = started.elapsed();
                 log(format!(
-                    "erro na requisição após {:.1}s: {e}",
+                    "request error after {:.1}s: {e}",
                     elapsed.as_secs_f64()
                 ));
                 format_request_error(&e, &method, &url, timeout, &timeout_from, elapsed)
@@ -1674,7 +1674,7 @@ fn perform_request(
         }
     };
 
-    log(format!("resultado em {}", result_uri_for(root.as_deref())));
+    log(format!("result at {}", result_uri_for(root.as_deref())));
     publish_result(state, sender, root.as_deref(), &content);
 
     // Segura o `⏳` o mínimo combinado; o resultado já está escrito, então a
@@ -1707,14 +1707,14 @@ fn resolve_timeout(
     if let Some(raw) = &req.timeout_raw {
         match raw.parse::<u64>() {
             Ok(secs) => return (to_timeout(secs), "# @timeout".to_string()),
-            Err(_) => log(format!("@timeout inválido, ignorando: {raw:?}")),
+            Err(_) => log(format!("invalid @timeout, ignoring: {raw:?}")),
         }
     }
     if let Some(raw) = dotenv.get(TIMEOUT_ENV_KEY) {
         match raw.trim().parse::<u64>() {
             Ok(secs) => return (to_timeout(secs), format!("{TIMEOUT_ENV_KEY} (.env)")),
             Err(_) => log(format!(
-                "{TIMEOUT_ENV_KEY} inválido no .env, ignorando: {:?}",
+                "invalid {TIMEOUT_ENV_KEY} in .env, ignoring: {:?}",
                 raw.trim()
             )),
         }
@@ -1810,7 +1810,7 @@ fn main() -> anyhow::Result<()> {
     init_log(root_path.as_deref());
     log("\n=== http request client lsp starting ===");
     log(format!("root_path = {root_path:?}"));
-    log(format!("artefatos em {}", artifact_dir().display()));
+    log(format!("artifacts at {}", artifact_dir().display()));
 
     let show_document_support = init_params
         .pointer("/capabilities/window/showDocument/support")
@@ -1823,7 +1823,7 @@ fn main() -> anyhow::Result<()> {
     if !responses.is_empty() {
         let total: usize = responses.values().map(|m| m.len()).sum();
         log(format!(
-            "{total} resposta(s) recuperada(s) de {}",
+            "{total} response(s) restored from {}",
             responses_path().display()
         ));
     }
@@ -1892,7 +1892,7 @@ fn handle_response(
     if !refused {
         return;
     }
-    log("window/showDocument recusado; usando applyEdit + CreateFile");
+    log("window/showDocument refused; using applyEdit + CreateFile");
     fall_back_to_apply_edit(state, sender, root);
 }
 
@@ -2005,7 +2005,7 @@ fn handle_request(
                 .iter()
                 .filter(|l| l.command.as_ref().is_some_and(|c| c.command == CMD_NOOP))
                 .count();
-            log(format!("-> codeLens {uri}: {} lens, {sending} enviando", lenses.len()));
+            log(format!("-> codeLens {uri}: {} lens, {sending} sending", lenses.len()));
             connection.sender.send(Message::Response(Response::new_ok(req.id, lenses)))?;
         }
         "workspace/executeCommand" => {
@@ -2016,7 +2016,7 @@ fn handle_request(
                 .send(Message::Response(Response::new_ok(req.id, Value::Null)))?;
         }
         other => {
-            log(format!("-> request não tratado: {other}"));
+            log(format!("-> unhandled request: {other}"));
             connection
                 .sender
                 .send(Message::Response(Response::new_ok(req.id, Value::Null)))?;
@@ -2140,7 +2140,7 @@ fn resolve_request(
                 .filter(|i| Some(keys[*i].0) == key)
                 .collect();
             let pool = if exact.is_empty() { &named } else { &exact };
-            return Some((tiebreak(pool), "nome"));
+            return Some((tiebreak(pool), "name"));
         }
     }
 
@@ -2153,14 +2153,14 @@ fn resolve_request(
             .map(|(i, _)| i)
             .collect();
         if !matching.is_empty() {
-            return Some((tiebreak(&matching), "identidade"));
+            return Some((tiebreak(&matching), "identity"));
         }
     }
 
     // 3) Pela linha, com o método corroborando quando o lens o informou.
     if let Some(i) = reqs.iter().position(|r| r.line == line) {
         if method.is_none_or(|m| m.eq_ignore_ascii_case(&reqs[i].method)) {
-            return Some((i, "linha"));
+            return Some((i, "line"));
         }
     }
 
@@ -2172,7 +2172,7 @@ fn handle_execute_command(connection: &Connection, state: &Shared, params: Execu
         return;
     }
     if params.command != CMD_SEND {
-        log(format!("comando desconhecido: {}", params.command));
+        log(format!("unknown command: {}", params.command));
         return;
     }
 
@@ -2188,7 +2188,7 @@ fn handle_execute_command(connection: &Connection, state: &Shared, params: Execu
     let name = params.arguments.get(4).and_then(|v| v.as_str());
     let method = params.arguments.get(5).and_then(|v| v.as_str());
     let (Some(uri), Some(clicked_line)) = (uri, clicked_line) else {
-        log("sendRequest sem argumentos válidos");
+        log("sendRequest without valid arguments");
         return;
     };
 
@@ -2198,7 +2198,7 @@ fn handle_execute_command(connection: &Connection, state: &Shared, params: Execu
         (guard.document_text(&uri), guard.root_path.clone())
     };
     let Some(text) = text else {
-        log(format!("documento não encontrado: {uri}"));
+        log(format!("document not found: {uri}"));
         return;
     };
     let (file_vars, reqs) = parse_document(&text);
@@ -2210,7 +2210,7 @@ fn handle_execute_command(connection: &Connection, state: &Shared, params: Execu
         // os argumentos de um lens que já desenhou. Por isso a mensagem manda
         // fechar e reabrir o arquivo, que é o que de fato funciona.
         log(format!(
-            "requisição não encontrada em {uri}:{clicked_line} \
+            "request not found at {uri}:{clicked_line} \
              (key={key:?} nth={nth:?} name={name:?} method={method:?})"
         ));
         refresh_code_lens(&connection.sender);
@@ -2230,14 +2230,14 @@ fn handle_execute_command(connection: &Connection, state: &Shared, params: Execu
         // O lens deslocou. Vale pedir os lenses de novo — em clientes que
         // atualizam os argumentos, o próximo clique já vem certo.
         log(format!(
-            "lens desatualizado em {uri}: clique em {clicked_line}, requisição em {line} (casou por {how})"
+            "outdated lens at {uri}: click at {clicked_line}, request at {line} (matched by {how})"
         ));
         refresh_code_lens(&connection.sender);
     } else if key != Some(request_key(&req)) {
         // A linha estava certa, mas o resto dos argumentos não: foi a requisição
         // que mudou de texto (mexer na query multilinha faz isso a cada edição).
         // Registrar ajuda a distinguir os dois desencontros no log.
-        log(format!("lens com argumentos velhos em {uri}:{line}, casou por {how}"));
+        log(format!("lens with stale arguments at {uri}:{line}, matched by {how}"));
     }
 
     // Impede empilhar duas execuções da mesma requisição. A garantia tem que
@@ -2251,7 +2251,7 @@ fn handle_execute_command(connection: &Connection, state: &Shared, params: Execu
             .name
             .clone()
             .unwrap_or_else(|| format!("{} {}", req.method, req.url));
-        log(format!("clique ignorado, já em andamento: {what} ({uri}:{line})"));
+        log(format!("click ignored, already running: {what} ({uri}:{line})"));
         show_message(
             &connection.sender,
             MessageType::WARNING,

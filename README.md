@@ -1,354 +1,362 @@
-# HTTP Request Client (extensão para o Zed)
+# HTTP Request Client (a Zed extension)
 
-Extensão para o [Zed](https://zed.dev) que adiciona suporte à linguagem `.http`
-(e `.rest`) — no mesmo espírito do REST Client do VS Code — permitindo escrever
-requisições HTTP em arquivos de texto simples, com destaque de sintaxe e
-execução das requisições direto do editor.
+An extension for [Zed](https://zed.dev) that adds support for the `.http` (and
+`.rest`) language — in the same spirit as VS Code's REST Client — letting you
+write HTTP requests in plain text files, with syntax highlighting and request
+execution straight from the editor.
 
-Arquivo de exemplo usado para desenvolvimento/testes: [`api.http`](./api.http),
-com variáveis lidas de um `.env` local — copie o modelo antes de usar:
+Example file used for development/testing: [`api.http`](./api.http), with
+variables read from a local `.env` — copy the template before using it:
 
 ```sh
 cp .env.example .env
 ```
 
-O `.env` é procurado a partir da pasta do próprio arquivo `.http`, subindo até
-a raiz do workspace, então é possível manter um `.env` por ambiente
-(ex.: `.rest/prd/.env`, `.rest/local/.env`). O mais próximo do arquivo tem
-prioridade. O `.env` em si não é versionado (ver [`.gitignore`](./.gitignore)).
+The `.env` is looked up starting from the folder of the `.http` file itself and
+walking up to the workspace root, so you can keep one `.env` per environment
+(e.g. `.rest/prd/.env`, `.rest/local/.env`). The one closest to the file wins.
+The `.env` itself is not versioned (see [`.gitignore`](./.gitignore)).
 
-## Status atual
+## Current status
 
-- [x] **Destaque de sintaxe** para `.http`/`.rest`
-- [x] Language Server nativo em Rust (execução real das requisições)
-- [x] Code Lens "▶ Send request" acima de cada método HTTP
-- [x] Indicador de carregamento no lugar do Code Lens durante a requisição
-- [x] Exibição do resultado (status line + headers + body formatado) em uma aba
-      ao lado
-- [x] Resolução do binário do language server (settings do Zed → build local do
-      repositório → `$PATH` → download do release)
-- [x] Distribuição: baixa o binário do GitHub Release automaticamente, sem
-      exigir `cargo install` (ver `src/lib.rs`)
+- [x] **Syntax highlighting** for `.http`/`.rest`
+- [x] Native language server in Rust (real request execution)
+- [x] `▶ Send request` Code Lens above every HTTP method
+- [x] Loading indicator in place of the Code Lens while the request runs
+- [x] Result display (status line + headers + formatted body) in a tab on the
+      side
+- [x] Language server binary resolution (Zed settings → local build of the
+      repository → `$PATH` → release download)
+- [x] Distribution: downloads the binary from the GitHub Release automatically,
+      with no need for `cargo install` (see `src/lib.rs`)
 
-### Destaque de sintaxe
+### Syntax highlighting
 
-Implementado de forma declarativa, usando a gramática
+Implemented declaratively, using the
 [tree-sitter-http](https://github.com/rest-nvim/tree-sitter-http)
-(MIT), a mesma usada pelo `rest.nvim`. Ela reconhece a estrutura de um arquivo
-`.http`: método, URL, versão HTTP, cabeçalhos, corpo, comentários, separadores
-de requisição (`###`), declarações de variável (`@NOME = valor`) e
-interpolações (`{{NOME}}`).
+grammar (MIT), the same one used by `rest.nvim`. It recognizes the structure of
+a `.http` file: method, URL, HTTP version, headers, body, comments, request
+separators (`###`), variable declarations (`@NAME = value`) and interpolations
+(`{{NAME}}`).
 
-O que é colorido:
+What gets colored:
 
-| Elemento                                   | Exemplo no `api.http`                        |
+| Element                                     | Example in `api.http`                         |
 |---------------------------------------------|-----------------------------------------------|
-| Método HTTP                                 | `POST`, `GET`                                 |
+| HTTP method                                 | `POST`, `GET`                                 |
 | URL                                          | `{{HOST}}/v1/oauth/login`                     |
-| Nome do cabeçalho                            | `content-type`, `Authorization`               |
-| Interpolação de variável                     | `{{USERNAME}}`, `{{oauthLogin.response...}}`  |
-| Declaração de variável                       | `@HOST = ...`                                 |
-| Metadado de comentário (`# @name`)           | `# @name oauthLogin`                          |
-| Separador de requisição                      | `###`                                         |
-| Status/versão HTTP (em respostas coladas)    | `HTTP/1.1`, `200`, `OK`                       |
-| Corpo JSON/XML                               | injetado com o grammar nativo de JSON/XML do Zed |
-| Query param comentado                        | `    # &sort=asc`                             |
+| Header name                                  | `content-type`, `Authorization`               |
+| Variable interpolation                       | `{{USERNAME}}`, `{{oauthLogin.response...}}`  |
+| Variable declaration                         | `@HOST = ...`                                 |
+| Comment metadata (`# @name`)                 | `# @name oauthLogin`                          |
+| Request separator                            | `###`                                         |
+| HTTP status/version (in pasted responses)    | `HTTP/1.1`, `200`, `OK`                       |
+| JSON/XML body                                | injected with Zed's native JSON/XML grammar   |
+| Commented-out query param                    | `    # &sort=asc`                             |
 
-Corpos `json`/`xml` são destacados recursivamente via *injection* usando os
-próprios grammars de JSON e XML já embutidos no Zed — o mesmo mecanismo que
-faz blocos de código dentro de Markdown ficarem coloridos.
+`json`/`xml` bodies are highlighted recursively via *injection*, using the JSON
+and XML grammars already bundled with Zed — the same mechanism that colors code
+blocks inside Markdown.
 
-O grammar usado é um **fork** do upstream, em
-[`grammars-src/`](./grammars-src/README.md), com dois patches:
+The grammar in use is a **fork** of upstream, in
+[`grammars-src/`](./grammars-src/README.md), with two patches:
 
-- uma linha comentada dentro de uma query string multilinha era engolida pela
-  URL e ficava com a cor de URL, indistinguível de um parâmetro ativo; agora
-  vira um nó `(comment)`;
-- indentação com **TAB** não era reconhecida como espaço em branco (TAB é
-  `\p{Cc}`, e o grammar usava `\p{Zs}`), o que fazia cada linha de uma query
-  string multilinha virar uma requisição solta. Isso afetava o arquivo inteiro,
-  não só as query strings.
+- a commented-out line inside a multi-line query string was swallowed by the URL
+  and ended up with the URL color, indistinguishable from an active parameter;
+  it now becomes a `(comment)` node;
+- indentation with **TAB** was not recognized as whitespace (TAB is `\p{Cc}`,
+  and the grammar used `\p{Zs}`), which made every line of a multi-line query
+  string become a standalone request. That affected the whole file, not just
+  query strings.
 
-## Estrutura do projeto
+## Project layout
 
-Workspace Cargo com dois crates: a extensão em WASM (que o Zed carrega e que
-apenas inicia o language server) e o language server nativo (que faz todo o
-trabalho — parse, resolução de variáveis e as requisições HTTP).
+A Cargo workspace with two crates: the WASM extension (which Zed loads, and
+which only starts the language server) and the native language server (which
+does all the work — parsing, variable resolution and the HTTP requests).
 
 ```
 .
-├── extension.toml              # manifesto da extensão, grammar e language server
-├── Cargo.toml                  # workspace: crate da extensão (cdylib) + lsp-server
+├── extension.toml              # extension manifest, grammar and language server
+├── Cargo.toml                  # workspace: extension crate (cdylib) + lsp-server
 ├── src/
-│   └── lib.rs                  # extensão WASM: só localiza/inicia o lsp-server
+│   └── lib.rs                  # WASM extension: only locates/starts the lsp-server
 ├── lsp-server/
-│   └── src/main.rs             # language server: parser do .http, variáveis,
-│                               # execução HTTP (ureq), code lens e comandos
+│   └── src/main.rs             # language server: .http parser, variables,
+│                               # HTTP execution (ureq), code lens and commands
 ├── languages/
 │   └── http/
-│       ├── config.toml         # associação de .http/.rest à linguagem
-│       ├── highlights.scm      # regras de destaque de sintaxe
-│       └── injections.scm      # injeção de JSON/XML dentro do corpo
+│       ├── config.toml         # association of .http/.rest with the language
+│       ├── highlights.scm      # syntax highlighting rules
+│       └── injections.scm      # JSON/XML injection inside the body
 ├── grammars-src/
-│   └── tree-sitter-http/       # fork do grammar (repo git próprio); é o que
-│                               # o extension.toml referencia. Não confundir
-│                               # com grammars/, que é o checkout gerado pelo Zed
-├── api.http                    # arquivo de exemplo/documentação
-├── example.csv                 # usado pelo exemplo de upload (`< ./example.csv`)
-└── .env.example                # modelo das variáveis usadas pelo api.http
+│   └── tree-sitter-http/       # grammar fork (its own git repo); this is what
+│                               # extension.toml references. Not to be confused
+│                               # with grammars/, the checkout Zed generates
+├── api.http                    # example/documentation file
+├── example.csv                 # used by the upload example (`< ./example.csv`)
+└── .env.example                # template for the variables used by api.http
 ```
 
-## Como testar localmente no Zed
+## Testing locally in Zed
 
-1. Compile o language server: `cargo build -p http_request_client_lsp`.
-   Para usar a extensão em **outros** projetos a partir deste checkout, instale-o
-   no `$PATH`: `cargo install --path lsp-server`. (Quem instala a extensão pela
-   loja do Zed não precisa disso — o binário é baixado do release; ver
-   [Como o binário do language server é encontrado](#como-o-binário-do-language-server-é-encontrado).)
-2. Habilite os Code Lens no `settings.json` do Zed: `"code_lens": "on"`.
-3. Abra o Zed **por um terminal que tenha o `cargo` no `PATH`** — o Zed herda o
-   ambiente de quem o iniciou e precisa dele para compilar a dev extension.
-4. `zed: install dev extension` (paleta de comandos) e selecione esta pasta.
-5. Copie o `.env` (`cp .env.example .env`) e abra o `api.http` — o destaque de
-   sintaxe é aplicado e o botão "▶ Send request" aparece acima de cada
-   requisição.
+1. Build the language server: `cargo build -p http_request_client_lsp`.
+   To use the extension in **other** projects from this checkout, install it on
+   `$PATH`: `cargo install --path lsp-server`. (Anyone installing the extension
+   from Zed's store doesn't need this — the binary is downloaded from the
+   release; see
+   [How the language server binary is found](#how-the-language-server-binary-is-found).)
+2. Enable Code Lens in Zed's `settings.json`: `"code_lens": "on"`.
+3. Open Zed **from a terminal that has `cargo` on `PATH`** — Zed inherits the
+   environment of whoever started it, and needs `cargo` to compile the dev
+   extension.
+4. `zed: install dev extension` (command palette) and select this folder.
+5. Copy the `.env` (`cp .env.example .env`) and open `api.http` — syntax
+   highlighting is applied and the `▶ Send request` button appears above each
+   request.
 
-Recomendado: `"autosave": "on_focus_change"` no `settings.json`. Ele só é
-necessário no caminho de fallback (clientes que não tratam
-`window/showDocument`), em que a aba de resultado é aberta via
-`workspace/applyEdit` e nasce "suja" (não salva): o autosave a deixa limpa, e é
-isso que permite que as respostas seguintes sejam atualizadas em disco sem roubar
-o foco do editor.
+Recommended: `"autosave": "on_focus_change"` in `settings.json`. It is only
+needed on the fallback path (clients that don't handle `window/showDocument`),
+where the result tab is opened via `workspace/applyEdit` and is born "dirty"
+(unsaved): autosave makes it clean, and that is what allows subsequent responses
+to be updated on disk without stealing focus from the editor.
 
-### Se a instalação falhar em `failed to compile grammar 'http'`
+### If installation fails with `failed to compile grammar 'http'`
 
-O Zed mantém um checkout do grammar em `grammars/` (gerado por ele, ignorado no
-git) e **se recusa a reaproveitá-lo quando o `repository` do `extension.toml`
-mudou**, com esta mensagem:
+Zed keeps a checkout of the grammar in `grammars/` (generated by Zed itself,
+git-ignored) and **refuses to reuse it once `extension.toml`'s `repository` has
+changed**, with this message:
 
 ```
 grammar directory '.../grammars/http' already exists,
 but is not a git clone of 'https://github.com/feapps/tree-sitter-http'
 ```
 
-É o caso de quem instalou a extensão quando o `[grammars.http] repository`
-apontava para um caminho local. Como `grammars/` é artefato regenerável, apague
-e instale de novo:
+This affects anyone who installed the extension while
+`[grammars.http] repository` pointed at a local path. Since `grammars/` is a
+regenerable artifact, delete it and install again:
 
 ```sh
 rm -rf grammars/
 ```
 
-O Zed clona o grammar do zero na próxima instalação. Vale o mesmo sempre que
-`repository` ou `rev` mudarem.
+Zed clones the grammar from scratch on the next install. The same applies
+whenever `repository` or `rev` changes.
 
-### Como o binário do language server é encontrado
+### How the language server binary is found
 
-A extensão WASM ([`src/lib.rs`](./src/lib.rs)) resolve o binário na seguinte
-ordem, da fonte mais explícita para a mais automática:
+The WASM extension ([`src/lib.rs`](./src/lib.rs)) resolves the binary in the
+following order, from the most explicit source to the most automatic:
 
-1. o caminho configurado no `settings.json` do Zed:
+1. the path configured in Zed's `settings.json`:
 
    ```json
    {
      "lsp": {
        "http-request-client": {
-         "binary": { "path": "/caminho/para/http-request-client-lsp" }
+         "binary": { "path": "/path/to/http-request-client-lsp" }
        }
      }
    }
    ```
 
-2. `target/debug/http-request-client-lsp` do próprio repositório da extensão,
-   quando é ele que está aberto no Zed — assim o ciclo de desenvolvimento
-   (`cargo build` → reiniciar o language server) funciona sem instalar nada;
-3. o `$PATH`, via `worktree.which(...)` — é o caso ao usar a extensão em outros
-   projetos, depois de `cargo install --path lsp-server`;
-4. o binário publicado no **GitHub Release** do repositório, baixado
-   automaticamente para a plataforma atual — é o caminho de quem instala a
-   extensão pela loja do Zed, sem precisar de Rust nem `cargo` na máquina.
+2. `target/debug/http-request-client-lsp` from the extension's own repository,
+   when that repository is the one open in Zed — this way the development cycle
+   (`cargo build` → restart the language server) works without installing
+   anything;
+3. `$PATH`, via `worktree.which(...)` — the case when using the extension in
+   other projects, after `cargo install --path lsp-server`;
+4. the binary published in the repository's **GitHub Release**, downloaded
+   automatically for the current platform — the path taken by anyone who
+   installs the extension from Zed's store, with no need for Rust or `cargo` on
+   the machine.
 
-O download do passo 4 usa o asset
-`http-request-client-lsp-<os>-<arch>.gz` do último release (`os` ∈
-`macos`/`linux`/`windows`, `arch` ∈ `aarch64`/`x86_64`/`x86`), publicado pelo
-workflow [`.github/workflows/release.yml`](./.github/workflows/release.yml). O
-binário é guardado num diretório versionado, reaproveitado nas execuções
-seguintes, e versões antigas são removidas. O progresso aparece na UI do Zed
-como status de instalação do language server.
+The download in step 4 uses the
+`http-request-client-lsp-<os>-<arch>.gz` asset from the latest release (`os` ∈
+`macos`/`linux`/`windows`, `arch` ∈ `aarch64`/`x86_64`/`x86`), published by the
+[`.github/workflows/release.yml`](./.github/workflows/release.yml) workflow. The
+binary is stored in a versioned directory, reused on subsequent runs, and older
+versions are removed. Progress shows up in Zed's UI as language server
+installation status.
 
-Se nenhuma das quatro funcionar, o Zed mostra o motivo da falha.
+If none of the four work, Zed shows the reason for the failure.
 
-## Funcionalidade "Send request"
+## The "Send request" feature
 
-- Um Code Lens `▶ Send request  (nome)` aparece na linha do método HTTP de cada
-  requisição (ex.: acima de `POST {{HOST}}/v1/oauth/login`). O nome vem de
-  `# @name`, quando presente.
-- Ao clicar, a requisição roda numa thread separada (o editor não trava) e o
-  progresso aparece em três lugares, em ordem de confiabilidade:
-  1. **`# ⏳ Sending…` no painel de resultado**, imediatamente, no lugar da
-     resposta anterior. É o feedback principal;
-  2. **barra de status do Zed**, via `$/progress` (`window/workDoneProgress/create`
-     + `begin`/`end`). Não depende de layout nem de foco;
-  3. **o Code Lens vira `⏳ Sending…`** — quando o Zed pede.
+- A `▶ Send request  (name)` Code Lens appears on the HTTP method line of every
+  request (e.g. above `POST {{HOST}}/v1/oauth/login`). The name comes from
+  `# @name`, when present.
+- On click, the request runs on a separate thread (the editor doesn't freeze) and
+  progress shows up in three places, in order of reliability:
+  1. **`# ⏳ Sending…` in the result panel**, immediately, in place of the
+     previous response. This is the primary feedback;
+  2. **Zed's status bar**, via `$/progress` (`window/workDoneProgress/create`
+     + `begin`/`end`). Doesn't depend on layout or focus;
+  3. **the Code Lens turns into `⏳ Sending…`** — when Zed asks for it.
 
-  **O `⏳` no Code Lens depende do layout dos painéis.** O Zed só pede os lenses
-  dos buffers *visíveis* de cada editor (`visible_buffers`), então:
+  **The `⏳` on the Code Lens depends on the panel layout.** Zed only requests
+  lenses for the *visible* buffers of each editor (`visible_buffers`), so:
 
-  - o painel de resultado **num split ao lado** do `.http` → os dois editores
-    ficam visíveis, o Zed pede os lenses dos dois e o botão troca para `⏳` e
-    volta normalmente;
-  - o painel de resultado como **aba no mesmo painel**, por cima do `.http` →
-    o editor do `.http` fica escondido, o Zed para de pedir os lenses dele e o
-    botão congela em `▶ Send request` mesmo durante a requisição.
+  - the result panel **in a split next to** the `.http` → both editors are
+    visible, Zed requests the lenses for both, and the button switches to `⏳`
+    and back normally;
+  - the result panel as a **tab in the same pane**, on top of the `.http` → the
+    `.http` editor is hidden, Zed stops requesting its lenses, and the button
+    stays frozen on `▶ Send request` even while the request is running.
 
-  No log a diferença é direta: no primeiro caso cada refresh gera um
-  `-> codeLens` para o `.http` **e** outro para o arquivo de resultado; no
-  segundo, só para o arquivo de resultado. Isso não é contornável pelo
-  servidor — daí os outros dois indicadores acima, e a trava abaixo.
-- **Uma requisição por vez, por linha.** Clicar de novo enquanto ela está em
-  andamento não dispara uma segunda: o clique é barrado no servidor (`inflight`)
-  e vira um aviso `⏳ <nome> is already running`. A trava tem que ficar aí
-  justamente porque o botão nem sempre chega a mudar para `⏳`. Requisições em
-  linhas diferentes continuam podendo rodar em paralelo.
-- Quando o servidor consegue servir o `⏳`, ele o segura por no mínimo 400 ms
-  (`MIN_LOADING`): o Zed espera 50 ms de debounce + 30 ms antes de pedir os
-  lenses de volta, e um `codeLens/refresh` novo **substitui** o pedido pendente
-  em vez de enfileirá-lo — então, numa requisição de poucos ms, o refresh do
-  fim cancelava o do começo. A espera só atrasa o botão voltar ao normal: a
-  resposta já foi escrita antes dela.
-- A resposta é sempre escrita em disco; se o cliente não tem o buffer aberto,
-  um `window/showDocument` (sem roubar o foco) mostra a aba. No fallback por
-  `applyEdit`, a primeira resposta vai pelo próprio edit — nesse caminho o buffer
-  ainda pode estar "sujo", e o watcher do Zed ignoraria a escrita em disco.
-- A requisição é resolvida e executada pelo `lsp-server` nativo (não pela
-  extensão WASM, que não tem acesso à rede):
-  - variáveis `{{NOME}}` são resolvidas a partir de declarações `@NOME = valor`
-    no arquivo e de variáveis do `.env` (`{{$dotenv NOME}}`). A resolução é
-    recursiva, então `@HOST = {{$dotenv HOST}}` funciona;
-  - o `.env` é procurado a partir da pasta do arquivo `.http`, subindo até a
-    raiz do workspace — o mais próximo tem prioridade, o que permite um `.env`
-    por ambiente (ex.: `.rest/prd/.env`);
-  - referências encadeadas a respostas anteriores são resolvidas a partir do
-    cache de respostas, que é **persistido** em
-    `<dir-privado>/responses.json` (`0600`), em três formas:
-    - `{{nome.response.body.caminho}}` — navega o JSON do corpo
-      (ex.: `{{login.response.body.json.key}}`);
-    - `{{nome.response.headers.Header}}` — valor de um cabeçalho da resposta
-      (match case-insensitive, ex.: `{{login.response.headers.content-type}}`);
-    - `{{nome.response.status}}` — código de status HTTP (ex.: `200`).
+  In the log the difference is plain: in the first case every refresh produces a
+  `-> codeLens` for the `.http` **and** another for the result file; in the
+  second, only for the result file. This can't be worked around from the server
+  — hence the two other indicators above, and the lock below.
+- **One request at a time, per line.** Clicking again while one is in flight
+  doesn't fire a second one: the click is blocked on the server (`inflight`) and
+  turns into a `⏳ <name> is already running` warning. The lock has to live there
+  precisely because the button doesn't always get to switch to `⏳`. Requests on
+  different lines can still run in parallel.
+- When the server does manage to serve the `⏳`, it holds it for at least 400 ms
+  (`MIN_LOADING`): Zed waits 50 ms of debounce + 30 ms before asking for the
+  lenses back, and a new `codeLens/refresh` **replaces** the pending request
+  instead of queueing it — so, on a request that takes a few ms, the refresh at
+  the end was cancelling the one at the start. The wait only delays the button
+  returning to normal: the response has already been written before it.
+- The response is always written to disk; if the client doesn't have the buffer
+  open, a `window/showDocument` (without stealing focus) reveals the tab. On the
+  `applyEdit` fallback, the first response goes through the edit itself — on that
+  path the buffer may still be "dirty", and Zed's watcher would ignore the write
+  to disk.
+- The request is resolved and executed by the native `lsp-server` (not by the
+  WASM extension, which has no network access):
+  - `{{NAME}}` variables are resolved from `@NAME = value` declarations in the
+    file and from `.env` variables (`{{$dotenv NAME}}`). Resolution is
+    recursive, so `@HOST = {{$dotenv HOST}}` works;
+  - the `.env` is looked up starting from the folder of the `.http` file and
+    walking up to the workspace root — the closest one wins, which allows one
+    `.env` per environment (e.g. `.rest/prd/.env`);
+  - chained references to previous responses are resolved from the response
+    cache, which is **persisted** in `<private-dir>/responses.json` (`0600`), in
+    three forms:
+    - `{{name.response.body.path}}` — walks the JSON of the body
+      (e.g. `{{login.response.body.json.key}}`);
+    - `{{name.response.headers.Header}}` — the value of a response header
+      (case-insensitive match, e.g. `{{login.response.headers.content-type}}`);
+    - `{{name.response.status}}` — HTTP status code (e.g. `200`).
 
-    Esse cache é **por ambiente**, sendo o ambiente a pasta do arquivo `.http` —
-    o mesmo critério usado para achar o `.env`. Então um `# @name login` em
-    `.rest/hml/api.http` e outro em `.rest/prd/api.http` guardam tokens
-    independentes: autenticar num ambiente não derruba a sessão do outro. Dois
-    arquivos `.http` na **mesma** pasta continuam compartilhando as respostas,
-    o que permite separar (por exemplo) `login.http` e `pedidos.http` sem
-    precisar repetir o login. Consequência: mover um `.http` para outra pasta
-    zera o encadeamento dele, porque mudou de ambiente.
+    This cache is **per environment**, the environment being the folder of the
+    `.http` file — the same criterion used to find the `.env`. So a
+    `# @name login` in `.rest/hml/api.http` and another in `.rest/prd/api.http`
+    keep independent tokens: authenticating in one environment doesn't drop the
+    other's session. Two `.http` files in the **same** folder still share
+    responses, which allows splitting (for instance) `login.http` and
+    `orders.http` without having to repeat the login. Consequence: moving a
+    `.http` to another folder resets its chaining, because the environment
+    changed.
 
-    O cache é persistido porque o Zed **para e sobe o language server no meio da
-    sessão** (derruba quando o último `.http` fecha, e também reinicia sozinho com
-    arquivos abertos — dá para ver no log um `=== starting ===` sem nenhum
-    `didClose` antes). Enquanto ele vivia só em memória, esse ciclo — invisível
-    para quem está usando — apagava o token do `# @name oauthLogin`, e as
-    requisições seguintes falhavam com "unresolved variables" sem nada na tela
-    explicando por quê.
+    The cache is persisted because Zed **stops and starts the language server
+    mid-session** (it kills it when the last `.http` closes, and it also restarts
+    on its own with files open — you can see a `=== starting ===` in the log with
+    no `didClose` before it). While the cache lived only in memory, that cycle —
+    invisible to whoever is using the extension — wiped the token from
+    `# @name oauthLogin`, and subsequent requests failed with "unresolved
+    variables" with nothing on screen explaining why.
 
-    **Fechar um `.http` apaga as respostas guardadas dele** (memória e disco), com
-    três ressalvas que existem para não apagar o que ainda está em uso:
+    **Closing a `.http` deletes its stored responses** (memory and disk), with
+    three caveats that exist so that things still in use don't get deleted:
 
-    - o ambiente é a *pasta*, então ele só é limpo quando **nenhum outro `.http`
-      aberto** o compartilha — fechar `login.http` não derruba a sessão do
-      `pedidos.http` aberto ao lado;
-    - a limpeza espera 3 s (`CLOSE_GRACE`) e é cancelada se o arquivo voltar
-      (`didOpen`) ou der sinal de vida (um pedido de Code Lens) nesse intervalo —
-      é o filtro para o `didClose` espúrio do Zed;
-    - um reinício do servidor **sem** `didClose` não apaga nada: só o que estava
-      pendente de limpeza é descartado no encerramento (`flush_pending_clears`).
+    - the environment is the *folder*, so it is only cleared when **no other open
+      `.http`** shares it — closing `login.http` doesn't drop the session of the
+      `orders.http` open next to it;
+    - the cleanup waits 3 s (`CLOSE_GRACE`) and is cancelled if the file comes
+      back (`didOpen`) or shows signs of life (a Code Lens request) within that
+      window — this is the filter for Zed's spurious `didClose`;
+    - a server restart **without** a `didClose` deletes nothing: only what was
+      pending cleanup is discarded on shutdown (`flush_pending_clears`).
 
-    Consequência assumida: fechar todos os `.http` e reabrir depois exige refazer
-    o login. Respostas maiores que 512 KiB (`MAX_RESPONSE_ENTRY_BYTES`) ficam só em
-    memória — dá para encadear com elas na sessão, mas elas não vão para o disco,
-    para uma listagem de 2 MB não impedir o token de 700 bytes de ser salvo (era o
-    que acontecia com um teto só no total: `respostas não persistidas` no log e
-    nada era gravado). Quando não sobra nenhuma resposta, o `responses.json` é
-    removido.
-  - inclusão de arquivo no corpo (estilo REST Client):
-    - `< caminho` insere o conteúdo do arquivo cru (caminho relativo ao `.http`);
-    - `<@ caminho` insere o conteúdo e resolve `{{...}}` dentro dele.
+    Accepted consequence: closing every `.http` and reopening later requires
+    logging in again. Responses larger than 512 KiB
+    (`MAX_RESPONSE_ENTRY_BYTES`) stay in memory only — you can chain off them
+    within the session, but they don't go to disk, so that a 2 MB listing doesn't
+    stop a 700-byte token from being saved (which is what happened with a cap on
+    the total alone: `responses not persisted` in the log and nothing was
+    written). When no response is left, `responses.json` is removed.
+  - file inclusion in the body (REST Client style):
+    - `< path` inserts the raw file contents (path relative to the `.http`);
+    - `<@ path` inserts the contents and resolves `{{...}}` inside them.
 
-    Por segurança, a leitura é **confinada à raiz do workspace**: o caminho é
-    canonicalizado (resolvendo `..` e symlinks) e recusado se escapar dela.
-    Sem isso, um `.http` de origem não confiável poderia incluir
-    `~/.ssh/id_rsa` e enviar o conteúdo para um servidor arbitrário com um
-    clique. Inclusões bloqueadas ficam registradas no log e a linha `< ...`
-    é mantida literal no corpo.
-  - se sobrar algum `{{...}}` sem resolver, a requisição **não** é enviada: o
-    resultado traz a lista das variáveis faltantes, em vez de um erro obscuro
-    do cliente HTTP.
-- O parser tolera os padrões comuns de arquivos reais: query string em várias
-  linhas (linhas iniciadas por `?` ou `&`), comentários entre os cabeçalhos,
-  parâmetros de query comentados e comentários depois do corpo (que não entram
-  no corpo enviado).
-- Com **vários `.http` abertos ao mesmo tempo**, todos mostram os lenses — e os
-  botões continuam funcionando depois de editar os arquivos. Quatro defesas no
-  servidor garantem isso, porque o cliente é a parte frágil aqui:
-  - quem desenha os lenses é o *editor*, e ele só busca os buffers já
-    registrados e visíveis nele. Duas corridas fazem essa busca cair no vazio,
-    sem nada reagendá-la depois: abrir um segundo `.http` (a busca chega antes
-    do registro do buffer) e abrir o Zed com `.http` já abertos (a restauração
-    do workspace é assíncrona, e a busca pode acontecer antes de o editor
-    existir — o servidor até responde os lenses, dá para ver no log, e a aba
-    fica sem botões até ser fechada e reaberta). O servidor manda
-    `workspace/codeLens/refresh` em 50 ms, 400 ms, 1,5 s e 4 s depois de cada
-    `didOpen` (`LENS_NUDGES_MS`) para cobrir as duas;
-  - os lenses não dependem do bookkeeping de `didOpen`/`didClose`: se o texto de
-    um documento não estiver em memória, ele é lido do disco. Um `didClose` a
-    mais (abas de preview, o mesmo arquivo em dois painéis) deixaria a aba muda
-    até ser reaberta;
-  - o clique não confia em nenhum argumento isolado do lens. O cliente **congela
-    os argumentos do comando** quando recebe o lens e ancora só a posição na tela,
-    e não os troca nem depois de receber os lenses de novo — medido: 104 lenses
-    novos entregues a cada `didChange` e o clique seguinte ainda chegou com os
-    argumentos antigos. O sintoma era o pior de todos: o botão simplesmente não
-    surtia efeito, e só fechar e reabrir o `.http` resolvia. Por isso o lens leva
-    **quatro pistas**, e `resolve_request` as testa da mais estável para a mais
-    frágil, porque cada uma morre com um tipo diferente de edição:
+    For safety, reading is **confined to the workspace root**: the path is
+    canonicalized (resolving `..` and symlinks) and refused if it escapes it.
+    Without that, a `.http` from an untrusted source could include
+    `~/.ssh/id_rsa` and send the contents to an arbitrary server with one click.
+    Blocked inclusions are recorded in the log and the `< ...` line is kept
+    literally in the body.
+  - if any `{{...}}` is left unresolved, the request is **not** sent: the result
+    lists the missing variables, instead of an obscure error from the HTTP
+    client.
+- The parser tolerates the common patterns of real-world files: query strings
+  across multiple lines (lines starting with `?` or `&`), comments between
+  headers, commented-out query parameters, and comments after the body (which
+  don't end up in the body sent).
+- With **several `.http` files open at once**, all of them show lenses — and the
+  buttons keep working after editing the files. Four defenses on the server
+  ensure that, because the client is the fragile part here:
+  - the lenses are drawn by the *editor*, and it only looks up buffers that are
+    already registered and visible in it. Two races make that lookup come up
+    empty, with nothing to reschedule it afterwards: opening a second `.http`
+    (the lookup arrives before the buffer is registered) and opening Zed with
+    `.http` files already open (workspace restoration is asynchronous, and the
+    lookup can happen before the editor exists — the server does answer the
+    lenses, you can see it in the log, and the tab stays without buttons until
+    it's closed and reopened). The server sends
+    `workspace/codeLens/refresh` at 50 ms, 400 ms, 1.5 s and 4 s after every
+    `didOpen` (`LENS_NUDGES_MS`) to cover both;
+  - the lenses don't depend on `didOpen`/`didClose` bookkeeping: if a document's
+    text isn't in memory, it is read from disk. One extra `didClose` (preview
+    tabs, the same file in two panes) would leave the tab mute until reopened;
+  - the click doesn't trust any single argument from the lens. The client
+    **freezes the command's arguments** when it receives the lens and anchors
+    only the on-screen position, and it doesn't swap them even after receiving
+    the lenses again — measured: 104 new lenses delivered on every `didChange`
+    and the next click still arrived with the old arguments. The symptom was the
+    worst of all: the button simply had no effect, and only closing and
+    reopening the `.http` fixed it. That's why the lens carries **four hints**,
+    and `resolve_request` tries them from the most stable to the most fragile,
+    because each one dies to a different kind of edit:
 
-    | pista | sobrevive a | morre com |
+    | hint | survives | dies with |
     | --- | --- | --- |
-    | `# @name` | qualquer mudança na URL | renomear a requisição |
-    | identidade (método + URL + nome) | deslocamento de linhas | qualquer edição no texto da requisição |
-    | linha | edição *dentro* da requisição | inserir/remover linhas acima |
-    | método | — | corrobora a linha |
+    | `# @name` | any change to the URL | renaming the request |
+    | identity (method + URL + name) | line shifts | any edit to the request's text |
+    | line | edits *inside* the request | inserting/removing lines above |
+    | method | — | corroborates the line |
 
-    As duas primeiras versões erraram justamente aqui. A primeira mandava só a
-    linha (`requisição na linha 1336 não encontrada`, com a requisição em 1330).
-    A segunda deu à identidade prioridade sobre a linha — e aí ligar um
-    `&page_size=100` na query multilinha passou a invalidar o botão para sempre:
-    `requisição não encontrada em ...:163 (key=Some(10878242406106393856))`, com a
-    linha 163 ainda **certa**. Nome antes de identidade antes de linha resolve os
-    dois, e o método impede o único risco real de cair na linha (linhas que
-    andaram fariam disparar a requisição errada — são chamadas de API de verdade).
-    Sem nenhuma casar, o servidor **avisa** em vez de ficar mudo, e a mensagem
-    manda fechar e reabrir o arquivo, porque o refresh não desfaz o congelamento;
-  - o servidor só pede `codeLens/refresh` numa edição quando ela mexeu na
-    **posição ou no nome** de alguma requisição (`lens_signature`). O refresh é
-    global: ele invalida os lenses de *todos* os buffers, mas o Zed só re-pede os
-    dos editores que considera visíveis — um `.http` escondido atrás da aba de
-    resposta, ou em outro painel, ficava sem nenhum lens até ser reaberto. Pedir
-    refresh a cada tecla digitada, como antes, fazia o "▶ Send request"
-    desaparecer depois de um tempo de uso; digitar dentro de um corpo JSON agora
-    não invalida nada.
+    The first two versions got exactly this wrong. The first sent only the line
+    (`request on line 1336 not found`, with the request at 1330). The
+    second gave identity priority over the line — and then appending an
+    `&page_size=100` to the multi-line query started invalidating the button
+    forever: `request not found at ...:163
+    (key=Some(10878242406106393856))`, with line 163 still **correct**. Name
+    before identity before line solves both, and the method rules out the only
+    real risk of falling back to the line (shifted lines would fire the wrong
+    request — these are real API calls). With none of them matching, the server
+    **warns** instead of staying mute, and the message says to close and reopen
+    the file, because a refresh doesn't undo the freezing;
+  - the server only asks for `codeLens/refresh` on an edit when the edit touched
+    the **position or the name** of some request (`lens_signature`). The refresh
+    is global: it invalidates the lenses of *every* buffer, but Zed only
+    re-requests those of the editors it considers visible — a `.http` hidden
+    behind the response tab, or in another pane, was left with no lenses at all
+    until reopened. Asking for a refresh on every keystroke, as before, made
+    `▶ Send request` disappear after some time of use; typing inside a JSON body
+    now invalidates nothing.
 
-  O log fica em `<dir-privado>/http-request-client-lsp-<nome-do-workspace>.log`
-  — um por projeto, porque o Zed sobe um language server por projeto aberto e
-  com um caminho fixo os logs se misturavam. Ele registra uma linha
-  `-> codeLens <uri>: N lens, M enviando` por requisição de lens, útil para
-  diferenciar "o servidor não respondeu" de "o cliente não pediu", e para ver
-  se o `⏳` chegou a ser servido.
-- O resultado é formatado como status line + cabeçalhos + corpo (pretty-print
-  quando JSON) e escrito em `<dir-privado>/requests/<nome-do-workspace>.http`:
+  The log lives in
+  `<private-dir>/http-request-client-lsp-<workspace-name>.log` — one per
+  project, because Zed starts one language server per open project and with a
+  fixed path the logs got mixed together. It records a
+  `-> codeLens <uri>: N lens, M sending` line per lens request, useful to tell
+  "the server didn't answer" from "the client didn't ask", and to see whether the
+  `⏳` was ever served.
+- The result is formatted as status line + headers + body (pretty-printed when
+  JSON) and written to `<private-dir>/requests/<workspace-name>.http`:
 
   ```
   HTTP/1.1 200 OK
@@ -361,105 +369,107 @@ Se nenhuma das quatro funcionar, o Zed mostra o motivo da falha.
   }
   ```
 
-  O buffer é atualizado em disco e o file watcher do Zed recarrega — sem roubar
-  o foco, o que permite deixá-lo num split ao lado do `.http`. Quando o cliente
-  não tem o arquivo aberto, ele é mostrado com `window/showDocument`
-  (`takeFocus: false`), que é idempotente: não duplica aba, não deixa o buffer
-  sujo e reabre a aba se ela tiver sido fechada.
+  The buffer is updated on disk and Zed's file watcher reloads it — without
+  stealing focus, which is what allows keeping it in a split next to the `.http`.
+  When the client doesn't have the file open, it is revealed with
+  `window/showDocument` (`takeFocus: false`), which is idempotent: it doesn't
+  duplicate the tab, doesn't leave the buffer dirty, and reopens the tab if it
+  was closed.
 
-  O Zed **não implementa** `window/showDocument` (medido em 2026-08-03: responde
-  `-32601 Unrecognized method`, e nem anuncia a capability), então hoje quem roda
-  na prática é o fallback abaixo; o caminho preferido fica pronto para quando ele
-  passar a implementar. Se o cliente recusar o `window/showDocument`, responder
-  com erro **ou não responder** em 3 s, o servidor passa a usar o mecanismo
-  anterior —
-  `workspace/applyEdit` com um `CreateFile`, uma vez por sessão — e entrega a
-  resposta daquela requisição por lá também. Esse caminho existe porque
-  `applyEdit` era, até aqui, a única forma conhecida de fazer o Zed abrir uma aba
-  a pedido do language server; ele tem duas contrapartidas que o `showDocument`
-  não tem: o `didClose` espúrio do Zed (aba de preview, o mesmo arquivo em dois
-  painéis) obriga a escolher entre **duplicar a aba** e **escrever a resposta num
-  arquivo invisível**, e o buffer nasce sujo (daí a recomendação de autosave).
+  Zed **does not implement** `window/showDocument` (measured 2026-08-03: it
+  answers `-32601 Unrecognized method`, and doesn't even announce the
+  capability), so what actually runs today is the fallback below; the preferred
+  path is ready for when Zed does implement it. If the client refuses the
+  `window/showDocument`, answers with an error **or doesn't answer** within 3 s,
+  the server falls back to the previous mechanism — `workspace/applyEdit` with a
+  `CreateFile`, once per session — and delivers that request's response through
+  it as well. That path exists because `applyEdit` was, up to now, the only known
+  way to make Zed open a tab at the language server's request; it has two
+  downsides `showDocument` doesn't: Zed's spurious `didClose` (preview tab, the
+  same file in two panes) forces a choice between **duplicating the tab** and
+  **writing the response to an invisible file**, and the buffer is born dirty
+  (hence the autosave recommendation).
 
-  O arquivo fica **fora do projeto**, com o nome do workspace — assim ele não
-  suja o repositório nem precisa de `.gitignore`, e dois projetos abertos ao
-  mesmo tempo não disputam o mesmo arquivo. Estar fora do worktree não
-  atrapalha: testei, e o Zed cria um worktree invisível de arquivo único para
-  ele, registra o language server nele e observa o arquivo normalmente — a
-  escrita em disco gera `didChange` como antes. Consequência esperada de morar
-  no diretório temporário: as respostas não sobrevivem a um boot.
+  The file lives **outside the project**, named after the workspace — this way it
+  doesn't pollute the repository and doesn't need a `.gitignore` entry, and two
+  projects open at the same time don't fight over the same file. Being outside
+  the worktree isn't a problem: I tested it, and Zed creates an invisible
+  single-file worktree for it, registers the language server in it and watches
+  the file normally — the write to disk produces `didChange` as before. Expected
+  consequence of living in the temp directory: responses don't survive a reboot.
 
-  O `<dir-privado>` é
-  `<temp>/http-request-client-<uid>/<nome-do-workspace>-<hash-da-raiz>/`, com
-  permissão `0700` (e os arquivos com `0600`). Respostas de API costumam trazer
-  tokens e dados sensíveis, e o diretório temporário é compartilhado: com um
-  caminho fixo e permissão padrão, qualquer outro usuário (ou serviço) da máquina
-  conseguiria **ler** as respostas, ou plantar um symlink no caminho previsível
-  para **desviar** a escrita. O diretório de cima é criado em modo exclusivo e,
-  se já existir, só é reaproveitado depois de conferir que é um diretório (não um
-  symlink), com `0700` e do nosso uid — senão o servidor cai num nome aleatório.
-  Como ninguém mais atravessa esse diretório, o subdiretório do workspace pode
-  ter nome previsível. As URLs registradas no log também vão **sem query
-  string**, que é onde tokens costumam viajar.
+  The `<private-dir>` is
+  `<temp>/http-request-client-<uid>/<workspace-name>-<workspace-root-hash>/`,
+  with `0700` permissions (and files with `0600`). API responses usually carry
+  tokens and sensitive data, and the temp directory is shared: with a fixed path
+  and default permissions, any other user (or service) on the machine could
+  **read** the responses, or plant a symlink on the predictable path to
+  **redirect** the write. The parent directory is created in exclusive mode and,
+  if it already exists, is only reused after checking that it is a directory (not
+  a symlink), with `0700` and owned by our uid — otherwise the server falls back
+  to a random name. Since nobody else traverses that directory, the workspace
+  subdirectory can have a predictable name. URLs recorded in the log also go
+  **without the query string**, which is where tokens tend to travel.
 
-  O caminho é **estável**: depende do usuário e da raiz do workspace, não do
-  processo. Ele já foi aleatório por processo, e isso era um bug — como o Zed
-  derruba e sobe o language server ao longo da sessão, cada ciclo estreava um
-  caminho de resultado, o Zed abria **mais uma aba de resposta** e as antigas
-  ficavam órfãs (era assim que apareciam dezenas de `/tmp/http-request-client-*`
-  numa tarde de uso).
+  The path is **stable**: it depends on the user and the workspace root, not on
+  the process. It used to be random per process, and that was a bug — since Zed
+  kills and starts the language server throughout the session, each cycle
+  debuted a new result path, Zed opened **yet another response tab** and the old
+  ones were orphaned (that's how dozens of `/tmp/http-request-client-*` showed up
+  over an afternoon of use).
 
-### Timeout das requisições
+### Request timeout
 
-Toda requisição tem um teto de duração, que vale para a **operação inteira**
-(DNS + conexão + envio + leitura da resposta), não por etapa. O default é 30 s.
+Every request has a duration cap, which applies to the **whole operation**
+(DNS + connection + send + reading the response), not per stage. The default is
+30 s.
 
-Dá para trocar em dois lugares, nesta ordem de precedência:
+It can be changed in two places, in this order of precedence:
 
-| onde | escopo | exemplo |
+| where | scope | example |
 | --- | --- | --- |
-| `# @timeout <segundos>` | só a requisição em que está | `# @timeout 120` |
-| `HTTP_REQUEST_TIMEOUT` no `.env` | todas as requisições do ambiente | `HTTP_REQUEST_TIMEOUT=120` |
-| *(nada)* | default | 30 s |
+| `# @timeout <seconds>` | only the request it sits on | `# @timeout 120` |
+| `HTTP_REQUEST_TIMEOUT` in the `.env` | every request of the environment | `HTTP_REQUEST_TIMEOUT=120` |
+| *(nothing)* | default | 30 s |
 
-`0` em qualquer um dos dois significa **sem limite**. É a mesma convenção do
-`rest-client.timeoutinmilliseconds` do REST Client do VS Code — que vem com `0`
-por padrão, e é por isso que uma requisição lenta "funciona no VS Code" e estoura
-aqui: lá ninguém desiste de esperar.
+`0` in either one means **no limit**. This is the same convention as VS Code
+REST Client's `rest-client.timeoutinmilliseconds` — which ships with `0` by
+default, and that's why a slow request "works in VS Code" and blows up here:
+over there nobody gives up waiting.
 
-A diretiva vai numa linha de comentário **acima da linha do método**, junto do
+The directive goes on a comment line **above the method line**, together with
 `# @name`:
 
 ```http
-# @name receivable_unitsIndex
+# @name clientsIndex
 # @timeout 120
-GET {{HOST}}/v1/receivable_units
+GET {{HOST}}/v1/clients
     ?from=2024-05-14
     &to=2026-08-03
 ###
 ```
 
-O `.env` é o mesmo procurado para `{{$dotenv ...}}` — da pasta do `.http` subindo
-até a raiz do workspace —, então o teto também pode ser por ambiente: um valor
-maior em `.rest/prd/.env` do que em `.rest/local/.env`. Um valor não numérico é
-ignorado (com registro no log) e a resolução cai para o nível seguinte.
+The `.env` is the same one looked up for `{{$dotenv ...}}` — from the folder of
+the `.http` up to the workspace root — so the cap can also be per environment: a
+larger value in `.rest/prd/.env` than in `.rest/local/.env`. A non-numeric value
+is ignored (with a log entry) and resolution falls through to the next level.
 
-O log de cada envio diz **qual dos três** valeu, o que separa "o default te
-pegou" de "o número que eu escolhi não foi suficiente":
+The log of each send says **which of the three** applied, which separates "the
+default caught you" from "the number I picked wasn't enough":
 
 ```
-2026-08-04T15:10:38.257-03:00 => GET http://127.0.0.1:8799/slow (timeout 2s, de # @timeout)
-2026-08-04T15:10:40.338-03:00 erro na requisição após 2.0s: timeout: global
+2026-08-04T15:10:38.257-03:00 => GET http://127.0.0.1:8799/slow (timeout 2s, from # @timeout)
+2026-08-04T15:10:40.338-03:00 request error after 2.0s: timeout: global
 ```
 
-**Estourar o timeout não cancela o trabalho do servidor.** O cliente só para de
-esperar; o que já começou do outro lado segue até o fim. Por isso o resultado de
-um timeout não é só o erro cru do cliente HTTP:
+**Blowing the timeout does not cancel the server's work.** The client merely
+stops waiting; whatever already started on the other side runs to completion.
+That's why the result of a timeout isn't just the raw error from the HTTP client:
 
 ```
 # Timeout after 30.0s
 
-GET https://exemplo/v1/recurso
+GET https://example/v1/resource
 
 Limit: 30s (set by default)
 
@@ -478,54 +488,56 @@ To allow more time:
 Use 0 in either place to wait with no limit.
 ```
 
-O aviso está aí porque a leitura intuitiva do timeout é errada e custa tempo de
-investigação: re-clicar depois de um timeout **empilha** outra execução em cima
-da anterior, que ainda está rodando no servidor. O sintoma disso — todas as
-tentativas seguintes estourando também, mesmo pedindo menos dados — é
-indistinguível de "a conexão ficou presa na primeira requisição". Não é: cada
-requisição constrói o seu próprio `ureq::Agent`, com pool e conexão TCP
-próprios, e quando é a trava de clique duplo que atua ela diz isso na cara
-(`⏳ <nome> is already running`, e `clique ignorado, já em andamento` no log).
+The warning is there because the intuitive reading of a timeout is wrong and
+costs investigation time: re-clicking after a timeout **stacks** another run on
+top of the previous one, which is still running on the server. The symptom of
+that — every subsequent attempt timing out too, even when asking for less data —
+is indistinguishable from "the connection got stuck on the first request". It
+isn't: each request builds its own `ureq::Agent`, with its own pool and TCP
+connection, and when it's the double-click lock that kicks in it says so up front
+(`⏳ <name> is already running`, and `click ignored, already running` in the
+log).
 
-Vale lembrar que reduzir o *tamanho da página* não necessariamente reduz o
-trabalho do servidor — se a API ordena por uma coluna diferente da que filtra, o
-`LIMIT` entra depois do sort e o banco varre a faixa inteira do mesmo jeito. Um
-timeout que não cede a `page_size=1` costuma ser isso, não o cliente.
+Worth remembering that reducing the *page size* doesn't necessarily reduce the
+server's work — if the API orders by a column different from the one it filters
+on, the `LIMIT` comes after the sort and the database scans the whole range
+anyway. A timeout that doesn't budge with `page_size=1` is usually this, not the
+client.
 
-### Log do servidor
+### Server log
 
-Fica em `<dir-privado>/http-request-client-lsp-<workspace>.log`, zerado quando
-passa de 2 MiB (`MAX_LOG_BYTES`). As URLs vão sem query string (`url_no_query`),
-que é onde tokens costumam viajar.
+Lives in `<private-dir>/http-request-client-lsp-<workspace>.log`, truncated when
+it grows past 2 MiB (`MAX_LOG_BYTES`). URLs go without the query string
+(`url_no_query`), which is where tokens tend to travel.
 
-Cada linha começa com o horário local no mesmo formato do `Zed.log` (RFC 3339
-com offset, mais os milissegundos). O formato é igual de propósito: é o que
-permite abrir os dois lado a lado e casar "cliquei aqui" com "o servidor fez
-aquilo" — sem isso, dá para saber *o que* aconteceu, mas não *quando* nem em que
-ordem, e nada de sobreposição entre requisições concorrentes aparece.
+Each line starts with the local time in the same format as `Zed.log` (RFC 3339
+with offset, plus milliseconds). The format matches on purpose: it's what allows
+opening the two side by side and matching "I clicked here" with "the server did
+that" — without it, you can tell *what* happened, but not *when* nor in what
+order, and no overlap between concurrent requests shows up.
 
-Cada linha é montada inteira e escrita numa **única** chamada de `write` em
-`O_APPEND`. Um `writeln!` com argumentos de formatação emite um `write` por
-pedaço da formatação, e como cada requisição roda na sua própria thread as linhas
-saíam entrelaçadas no arquivo (`=> GET /x<- response (id ...)`) — justamente nos
-trechos concorrentes, que são os que mais interessam ao investigar.
+Each line is assembled whole and written in a **single** `write` call in
+`O_APPEND`. A `writeln!` with formatting arguments emits one `write` per piece of
+the formatting, and since each request runs on its own thread the lines came out
+interleaved in the file (`=> GET /x<- response (id ...)`) — precisely in the
+concurrent stretches, which are the ones that matter most when investigating.
 
-### Limitação conhecida (destaque de sintaxe)
+### Known limitation (syntax highlighting)
 
-A gramática `tree-sitter-http` reconhece interpolações no formato
-`{{identificador}}` (sem espaço) — cobre bem casos como
-`{{login.response.body.json.key}}`. Já variáveis de processador com
-argumento e espaço, como `{{$dotenv HOST}}`, não são reconhecidas como o nó
-`variable` e por isso não recebem o destaque de colchetes/identificador;
-o texto continua correto e funcional, só não fica colorido como variável.
-Ajustar isso exigiria estender a gramática.
+The `tree-sitter-http` grammar recognizes interpolations in the
+`{{identifier}}` form (no space) — it covers cases like
+`{{login.response.body.json.key}}` well. Processor variables with an argument and
+a space, such as `{{$dotenv HOST}}`, are not recognized as a `variable` node and
+therefore don't get the brace/identifier highlighting; the text is still correct
+and functional, it just isn't colored as a variable. Fixing this would require
+extending the grammar.
 
-**Comentários logo após o corpo (body) quebram o destaque do restante do
-arquivo.** A gramática `tree-sitter-http` (mesmo na versão mais recente) aceita
-comentários **antes** dos cabeçalhos, mas não lida bem com comentários **depois
-do body** de uma requisição, antes do próximo `###`. Como a recuperação de erro
-da gramática é fraca, um único caso desses gera um nó de erro que se propaga e
-"apaga" as cores de tudo que vem depois no arquivo. Exemplo que quebra:
+**Comments right after the body break the highlighting for the rest of the
+file.** The `tree-sitter-http` grammar (even in its latest version) accepts
+comments **before** the headers, but doesn't handle comments **after the body** of
+a request, before the next `###`. Since the grammar's error recovery is weak, a
+single case like that produces an error node that propagates and "erases" the
+colors of everything that follows in the file. An example that breaks:
 
 ```http
 # @name updateExample
@@ -533,38 +545,37 @@ PUT {{HOST}}/put
 content-type: {{CONTENT_TYPE}}
 
 {
-  "name": "novo nome",
+  "name": "new name",
   "active": true
 }
 
-# active: liga/desliga o registro   <- comentário após o body: quebra o highlight
+# active: enables/disables the record   <- comment after the body: breaks highlighting
 ###
 ```
 
-Workaround: colocar os comentários de documentação **antes** do body (junto aos
-cabeçalhos, onde a gramática os aceita):
+Workaround: put documentation comments **before** the body (next to the headers,
+where the grammar accepts them):
 
 ```http
 # @name updateExample
-# active: liga/desliga o registro   <- comentário antes do body: OK
+# active: enables/disables the record   <- comment before the body: OK
 PUT {{HOST}}/put
 content-type: {{CONTENT_TYPE}}
 
 {
-  "name": "novo nome",
+  "name": "new name",
   "active": true
 }
 ###
 ```
 
-Isso afeta apenas o **destaque de sintaxe**; a execução da requisição
-(`Send request`), o parsing e a resolução de variáveis funcionam normalmente
-mesmo com comentários após o body. A correção definitiva exigiria estender a
-regra de comentários e a recuperação de erro da gramática — o fork em
-[`grammars-src/`](./grammars-src/README.md) já é o lugar para isso (foi onde o
-caso dos comentários em query params foi resolvido).
+This affects only **syntax highlighting**; request execution (`Send request`),
+parsing and variable resolution work normally even with comments after the body.
+A definitive fix would require extending the comment rule and the grammar's error
+recovery — the fork in [`grammars-src/`](./grammars-src/README.md) is already the
+place for that (it's where the commented-out query params case was solved).
 
-## Créditos
+## Credits
 
 - Grammar: [rest-nvim/tree-sitter-http](https://github.com/rest-nvim/tree-sitter-http) (MIT),
-  usado através do fork em [`grammars-src/`](./grammars-src/README.md)
+  used through the fork in [`grammars-src/`](./grammars-src/README.md)
