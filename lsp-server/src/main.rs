@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use chrono::Local;
 use crossbeam_channel::Sender;
 use lsp_server::{Connection, Message, Notification, Request as LspRequest, RequestId, Response};
 use lsp_types::{
@@ -72,6 +73,19 @@ const MIN_LOADING: Duration = Duration::from_millis(400);
 /// propósito: desistir cedo de um cliente que só está ocupado é que abriria a
 /// aba duas vezes.
 const SHOW_DOCUMENT_TIMEOUT: Duration = Duration::from_millis(3_000);
+/// Teto default de duração de uma requisição, quando o `.http` não pede outro.
+///
+/// Vale para a operação inteira (DNS + conexão + envio + resposta), não por
+/// etapa. Pode ser trocado por requisição com `# @timeout <segundos>` ou por
+/// workspace com [`TIMEOUT_ENV_KEY`] no `.env`; `0` em qualquer um dos dois
+/// remove o limite. Ver [`resolve_timeout`].
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Chave do `.env` que troca o [`DEFAULT_TIMEOUT`] deste workspace, em segundos.
+///
+/// O nome é longo de propósito: o `.env` consultado é o do projeto, que
+/// costuma ser o da própria aplicação, e um `TIMEOUT` solto ali colidiria com
+/// a configuração de alguém.
+const TIMEOUT_ENV_KEY: &str = "HTTP_REQUEST_TIMEOUT";
 /// Quanto esperar depois de um `didClose` antes de apagar as respostas daquele
 /// `.http` (ver [`schedule_response_cleanup`]).
 ///
@@ -330,6 +344,15 @@ fn init_log(root: Option<&str>) {
     let _ = LOG_PATH.set(path);
 }
 
+/// Horário local no formato do `Zed.log` (RFC 3339 com offset), mais os
+/// milissegundos.
+///
+/// O mesmo formato dos dois lados é o que permite abrir este log e o do Zed lado
+/// a lado e casar "cliquei aqui" com "o servidor fez aquilo".
+fn now_stamp() -> String {
+    Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string()
+}
+
 fn log(msg: impl AsRef<str>) {
     let path = LOG_PATH.get_or_init(|| artifact_dir().join("http-request-client-lsp.log"));
     let mut o = std::fs::OpenOptions::new();
@@ -339,8 +362,14 @@ fn log(msg: impl AsRef<str>) {
         use std::os::unix::fs::OpenOptionsExt as _;
         o.mode(0o600);
     }
+    // Monta a linha inteira antes de escrever. Um `writeln!` com argumentos de
+    // formatação emite uma chamada de `write` por pedaço, e como cada requisição
+    // roda na sua própria thread as linhas saíam entrelaçadas no arquivo
+    // (`=> GET /x<- response (id ...)`) — justamente nos trechos concorrentes que
+    // mais interessam ao investigar. Uma escrita só em `O_APPEND` é atômica.
+    let line = format!("{} {}\n", now_stamp(), msg.as_ref());
     if let Ok(mut f) = o.open(path) {
-        let _ = writeln!(f, "{}", msg.as_ref());
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -607,6 +636,14 @@ struct HttpRequest {
     url: String,
     headers: Vec<(String, String)>,
     body: Option<String>,
+    /// Valor cru de `# @timeout <segundos>`, se a requisição tiver a diretiva.
+    ///
+    /// Fica cru de propósito: `parse_document` roda a cada `codeLens`, ou seja a
+    /// cada tecla digitada no arquivo, então validar aqui significa logar o mesmo
+    /// erro dezenas de vezes. Quem interpreta é [`resolve_timeout`], uma vez por
+    /// envio. `None` é "não pedi nada, use o default do workspace"; `"0"` é
+    /// "sem limite".
+    timeout_raw: Option<String>,
 }
 
 fn is_http_method(s: &str) -> bool {
@@ -622,6 +659,7 @@ fn parse_document(text: &str) -> (HashMap<String, String>, Vec<HttpRequest>) {
     let mut reqs = Vec::new();
     let lines: Vec<&str> = text.lines().collect();
     let mut cur_name: Option<String> = None;
+    let mut cur_timeout: Option<String> = None;
     let mut idx = 0usize;
 
     while idx < lines.len() {
@@ -631,6 +669,7 @@ fn parse_document(text: &str) -> (HashMap<String, String>, Vec<HttpRequest>) {
         // Separador de requisições.
         if trimmed.starts_with("###") {
             cur_name = None;
+            cur_timeout = None;
             idx += 1;
             continue;
         }
@@ -648,11 +687,14 @@ fn parse_document(text: &str) -> (HashMap<String, String>, Vec<HttpRequest>) {
             }
         }
 
-        // Comentário (# ou //). `# @name X` define o nome da próxima requisição.
+        // Comentário (# ou //). `# @name X` define o nome da próxima requisição
+        // e `# @timeout N` o teto dela em segundos.
         if trimmed.starts_with('#') || trimmed.starts_with("//") {
             let content = trimmed.trim_start_matches(['#', '/']).trim();
             if let Some(n) = content.strip_prefix("@name") {
                 cur_name = Some(n.trim().to_string());
+            } else if let Some(t) = content.strip_prefix("@timeout") {
+                cur_timeout = Some(t.trim().to_string());
             }
             idx += 1;
             continue;
@@ -741,6 +783,7 @@ fn parse_document(text: &str) -> (HashMap<String, String>, Vec<HttpRequest>) {
             url,
             headers,
             body,
+            timeout_raw: cur_timeout.take(),
         });
     }
 
@@ -1432,6 +1475,49 @@ fn format_response(
     out
 }
 
+/// Mensagem de erro da requisição, com um texto à parte para timeout.
+///
+/// O timeout merece o tratamento separado porque a leitura intuitiva dele é
+/// errada e custa tempo de investigação: desistir de esperar **não cancela** o
+/// trabalho do outro lado. Quem vê o `⏳` sumir com "timeout" clica de novo, e
+/// esse segundo clique não substitui a execução anterior — soma outra em cima
+/// dela, ainda em andamento no servidor. O sintoma (todas as tentativas
+/// seguintes estourando também, mesmo pedindo menos dados) é indistinguível de
+/// uma conexão presa no cliente, que é justamente o que **não** está
+/// acontecendo: cada requisição abre um `ureq::Agent` novo, com pool e conexão
+/// próprios.
+fn format_request_error(
+    e: &anyhow::Error,
+    method: &str,
+    url: &str,
+    timeout: Option<Duration>,
+    timeout_from: &str,
+    elapsed: Duration,
+) -> String {
+    let timed_out = matches!(e.downcast_ref::<ureq::Error>(), Some(ureq::Error::Timeout(_)));
+    if !timed_out {
+        return format!("# Error running the request\n\n{method} {url}\n\n{e}\n");
+    }
+    let limit = match timeout {
+        Some(d) => format!("{}s", d.as_secs()),
+        None => "none".to_string(),
+    };
+    let mut out = format!("# Timeout after {:.1}s\n\n{method} {url}\n\n", elapsed.as_secs_f64());
+    out.push_str(&format!("Limit: {limit} (set by {timeout_from})\n\n"));
+    out.push_str(
+        "The client stopped waiting, but the server may still be working on this \
+         request — a timeout here does not cancel anything on the other side.\n\n\
+         Clicking \"Send request\" again does not replace that work: it starts \
+         another request on top of the one still running, which usually makes \
+         both slower. Prefer waiting, or narrowing the request.\n\n",
+    );
+    out.push_str("To allow more time:\n\n");
+    out.push_str("  - this request only:  # @timeout 120   (seconds, on a line above it)\n");
+    out.push_str("  - whole workspace:    HTTP_REQUEST_TIMEOUT=120   (in .env)\n\n");
+    out.push_str("Use 0 in either place to wait with no limit.\n");
+    out
+}
+
 /// Mantém a entrada de `inflight` viva enquanto a requisição roda e a remove no
 /// fim — inclusive se a thread entrar em pânico, que antes deixava o Code Lens
 /// preso em `⏳ Sending…` para sempre e todo clique seguinte era recusado com
@@ -1500,7 +1586,15 @@ fn perform_request(
         )
     });
 
-    log(format!("=> {method} {}", url_no_query(&url)));
+    let (timeout, timeout_from) = resolve_timeout(&req, &dotenv);
+    log(format!(
+        "=> {method} {} (timeout {}, de {timeout_from})",
+        url_no_query(&url),
+        match timeout {
+            Some(d) => format!("{}s", d.as_secs()),
+            None => "sem limite".to_string(),
+        }
+    ));
 
     // Indicador de progresso na barra de status, encerrado no fim desta função
     // (inclusive em caso de erro) pelo Drop.
@@ -1542,7 +1636,8 @@ fn perform_request(
              root.\n"
         )
     } else {
-        match do_http(&method, &url, &headers, body.as_deref()) {
+        let started = Instant::now();
+        match do_http(&method, &url, &headers, body.as_deref(), timeout) {
             Ok((code, reason, resp_headers, resp_body, content_type)) => {
                 // Guarda status + body + headers para encadeamento (se tem nome).
                 if let Some(name) = &req.name {
@@ -1569,8 +1664,12 @@ fn perform_request(
                 format_response(code, &reason, &resp_headers, &resp_body, &content_type)
             }
             Err(e) => {
-                log(format!("erro na requisição: {e}"));
-                format!("# Error running the request\n\n{method} {url}\n\n{e}\n")
+                let elapsed = started.elapsed();
+                log(format!(
+                    "erro na requisição após {:.1}s: {e}",
+                    elapsed.as_secs_f64()
+                ));
+                format_request_error(&e, &method, &url, timeout, &timeout_from, elapsed)
             }
         }
     };
@@ -1586,18 +1685,56 @@ fn perform_request(
     }
 }
 
+/// `0` segundos quer dizer "sem limite", mesma convenção do
+/// `rest-client.timeoutinmilliseconds` do REST Client.
+fn to_timeout(secs: u64) -> Option<Duration> {
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// Teto desta requisição e de onde ele veio, na ordem: `# @timeout` no próprio
+/// `.http`, senão [`TIMEOUT_ENV_KEY`] no `.env`, senão [`DEFAULT_TIMEOUT`].
+///
+/// A origem volta junto para as mensagens poderem dizer qual das três configurou
+/// o valor — sem isso, "timeout" não distingue "o default te pegou" de "o número
+/// que você escolheu não foi suficiente".
+fn resolve_timeout(
+    req: &HttpRequest,
+    dotenv: &HashMap<String, String>,
+) -> (Option<Duration>, String) {
+    // Um valor inválido é ignorado (cai no próximo da ordem) em vez de virar
+    // erro: a alternativa seria recusar a requisição por causa de um comentário
+    // malformado, com o botão de enviar ali do lado.
+    if let Some(raw) = &req.timeout_raw {
+        match raw.parse::<u64>() {
+            Ok(secs) => return (to_timeout(secs), "# @timeout".to_string()),
+            Err(_) => log(format!("@timeout inválido, ignorando: {raw:?}")),
+        }
+    }
+    if let Some(raw) = dotenv.get(TIMEOUT_ENV_KEY) {
+        match raw.trim().parse::<u64>() {
+            Ok(secs) => return (to_timeout(secs), format!("{TIMEOUT_ENV_KEY} (.env)")),
+            Err(_) => log(format!(
+                "{TIMEOUT_ENV_KEY} inválido no .env, ignorando: {:?}",
+                raw.trim()
+            )),
+        }
+    }
+    (Some(DEFAULT_TIMEOUT), "default".to_string())
+}
+
 /// Faz a requisição HTTP (bloqueante). Retorna (status, reason, headers, body, content-type).
 fn do_http(
     method: &str,
     url: &str,
     headers: &[(String, String)],
     body: Option<&str>,
+    timeout: Option<Duration>,
 ) -> anyhow::Result<(u16, String, Vec<(String, String)>, String, String)> {
     use ureq::http::Request;
 
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false) // queremos ver o corpo mesmo em 4xx/5xx
-        .timeout_global(Some(Duration::from_secs(30)))
+        .timeout_global(timeout)
         // Ao seguir um redirect, nunca reenvia o header `Authorization`: se o
         // destino responder 3xx apontando para outro host, a credencial não vai
         // junto. É o default do ureq, fixado aqui para não depender dele caso

@@ -10,6 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
+# Só para o horário local nas linhas de log. O formato precisa casar com o do
+# Zed.log (RFC 3339 com offset local) para dar para cruzar os dois lado a lado, e
+# derivar offset de fuso à mão é justamente o tipo de coisa que não se escreve.
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 crossbeam-channel = "0.5.16"
 lsp-server = "0.10.0"
 lsp-types = "0.97.0"

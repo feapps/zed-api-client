@@ -111,3 +111,19 @@ Content-Type: text/csv
 < ./example.csv
 --EXAMPLE-BOUNDARY--
 ###
+
+### Timeout ------------------------------------------------------------------
+
+# @name timeoutExample
+# O teto default é de 30s para a operação inteira. `# @timeout <segundos>` troca
+# o teto só desta requisição; `HTTP_REQUEST_TIMEOUT` no .env troca o de todas as
+# do ambiente. `0` em qualquer um dos dois = sem limite.
+#
+# O /delay/2 do httpbin responde depois de 2s, então este passa com folga.
+# Baixando o @timeout para 1 ele estoura, e o resultado explica que desistir de
+# esperar não cancela o trabalho do servidor — e que re-clicar empilha outra
+# execução em cima da anterior em vez de substituí-la.
+# @timeout 5
+GET {{HOST}}/delay/2
+Accept: {{CONTENT_TYPE}}
+###

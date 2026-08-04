@@ -409,6 +409,107 @@ Se nenhuma das quatro funcionar, o Zed mostra o motivo da falha.
   ficavam órfãs (era assim que apareciam dezenas de `/tmp/http-request-client-*`
   numa tarde de uso).
 
+### Timeout das requisições
+
+Toda requisição tem um teto de duração, que vale para a **operação inteira**
+(DNS + conexão + envio + leitura da resposta), não por etapa. O default é 30 s.
+
+Dá para trocar em dois lugares, nesta ordem de precedência:
+
+| onde | escopo | exemplo |
+| --- | --- | --- |
+| `# @timeout <segundos>` | só a requisição em que está | `# @timeout 120` |
+| `HTTP_REQUEST_TIMEOUT` no `.env` | todas as requisições do ambiente | `HTTP_REQUEST_TIMEOUT=120` |
+| *(nada)* | default | 30 s |
+
+`0` em qualquer um dos dois significa **sem limite**. É a mesma convenção do
+`rest-client.timeoutinmilliseconds` do REST Client do VS Code — que vem com `0`
+por padrão, e é por isso que uma requisição lenta "funciona no VS Code" e estoura
+aqui: lá ninguém desiste de esperar.
+
+A diretiva vai numa linha de comentário **acima da linha do método**, junto do
+`# @name`:
+
+```http
+# @name receivable_unitsIndex
+# @timeout 120
+GET {{HOST}}/v1/receivable_units
+    ?from=2024-05-14
+    &to=2026-08-03
+###
+```
+
+O `.env` é o mesmo procurado para `{{$dotenv ...}}` — da pasta do `.http` subindo
+até a raiz do workspace —, então o teto também pode ser por ambiente: um valor
+maior em `.rest/prd/.env` do que em `.rest/local/.env`. Um valor não numérico é
+ignorado (com registro no log) e a resolução cai para o nível seguinte.
+
+O log de cada envio diz **qual dos três** valeu, o que separa "o default te
+pegou" de "o número que eu escolhi não foi suficiente":
+
+```
+2026-08-04T15:10:38.257-03:00 => GET http://127.0.0.1:8799/slow (timeout 2s, de # @timeout)
+2026-08-04T15:10:40.338-03:00 erro na requisição após 2.0s: timeout: global
+```
+
+**Estourar o timeout não cancela o trabalho do servidor.** O cliente só para de
+esperar; o que já começou do outro lado segue até o fim. Por isso o resultado de
+um timeout não é só o erro cru do cliente HTTP:
+
+```
+# Timeout after 30.0s
+
+GET https://exemplo/v1/recurso
+
+Limit: 30s (set by default)
+
+The client stopped waiting, but the server may still be working on this
+request — a timeout here does not cancel anything on the other side.
+
+Clicking "Send request" again does not replace that work: it starts another
+request on top of the one still running, which usually makes both slower.
+Prefer waiting, or narrowing the request.
+
+To allow more time:
+
+  - this request only:  # @timeout 120   (seconds, on a line above it)
+  - whole workspace:    HTTP_REQUEST_TIMEOUT=120   (in .env)
+
+Use 0 in either place to wait with no limit.
+```
+
+O aviso está aí porque a leitura intuitiva do timeout é errada e custa tempo de
+investigação: re-clicar depois de um timeout **empilha** outra execução em cima
+da anterior, que ainda está rodando no servidor. O sintoma disso — todas as
+tentativas seguintes estourando também, mesmo pedindo menos dados — é
+indistinguível de "a conexão ficou presa na primeira requisição". Não é: cada
+requisição constrói o seu próprio `ureq::Agent`, com pool e conexão TCP
+próprios, e quando é a trava de clique duplo que atua ela diz isso na cara
+(`⏳ <nome> is already running`, e `clique ignorado, já em andamento` no log).
+
+Vale lembrar que reduzir o *tamanho da página* não necessariamente reduz o
+trabalho do servidor — se a API ordena por uma coluna diferente da que filtra, o
+`LIMIT` entra depois do sort e o banco varre a faixa inteira do mesmo jeito. Um
+timeout que não cede a `page_size=1` costuma ser isso, não o cliente.
+
+### Log do servidor
+
+Fica em `<dir-privado>/http-request-client-lsp-<workspace>.log`, zerado quando
+passa de 2 MiB (`MAX_LOG_BYTES`). As URLs vão sem query string (`url_no_query`),
+que é onde tokens costumam viajar.
+
+Cada linha começa com o horário local no mesmo formato do `Zed.log` (RFC 3339
+com offset, mais os milissegundos). O formato é igual de propósito: é o que
+permite abrir os dois lado a lado e casar "cliquei aqui" com "o servidor fez
+aquilo" — sem isso, dá para saber *o que* aconteceu, mas não *quando* nem em que
+ordem, e nada de sobreposição entre requisições concorrentes aparece.
+
+Cada linha é montada inteira e escrita numa **única** chamada de `write` em
+`O_APPEND`. Um `writeln!` com argumentos de formatação emite um `write` por
+pedaço da formatação, e como cada requisição roda na sua própria thread as linhas
+saíam entrelaçadas no arquivo (`=> GET /x<- response (id ...)`) — justamente nos
+trechos concorrentes, que são os que mais interessam ao investigar.
+
 ### Limitação conhecida (destaque de sintaxe)
 
 A gramática `tree-sitter-http` reconhece interpolações no formato
