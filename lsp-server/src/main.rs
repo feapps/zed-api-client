@@ -58,7 +58,7 @@ const MAX_RESPONSES_BYTES: usize = 8 << 20;
 /// Teto do arquivo de log: o diretório agora é estável por workspace, então o
 /// log sobrevive aos reinícios do servidor e cresceria sem fim.
 const MAX_LOG_BYTES: u64 = 2 << 20;
-/// Tempo mínimo que o `⏳ Enviando…` fica no lugar do Code Lens.
+/// Tempo mínimo que o `⏳ Sending…` fica no lugar do Code Lens.
 ///
 /// O Zed espera 50 ms (debounce) + 30 ms antes de pedir os lenses de volta, e
 /// cada `workspace/codeLens/refresh` novo *substitui* o pedido pendente em vez
@@ -109,7 +109,7 @@ fn next_n() -> i32 {
 /// Um `unwrap()` aqui transformava um pânico em qualquer thread num servidor
 /// zumbi: o lock ficava envenenado e todas as threads seguintes morriam ao
 /// tentar tomá-lo — o processo continuava vivo, sem responder nada, e a UI ficava
-/// travada no `⏳ Enviando…`. Um estado eventualmente inconsistente é bem melhor
+/// travada no `⏳ Sending…`. Um estado eventualmente inconsistente é bem melhor
 /// do que isso.
 fn lock_state(state: &Shared) -> MutexGuard<'_, State> {
     state.lock().unwrap_or_else(|e| e.into_inner())
@@ -382,7 +382,7 @@ struct State {
     /// Persistidas em disco (ver [`save_responses`]): o Zed derruba o language
     /// server quando o último `.http` fecha, e sem isso o token do `# @name
     /// oauthLogin` morria junto — as requisições seguintes falhavam com
-    /// "variáveis não resolvidas" sem nada na tela explicando por quê.
+    /// "unresolved variables" sem nada na tela explicando por quê.
     responses: Responses,
     /// Requisições em andamento (uri, linha) — para o indicador de loading.
     inflight: HashSet<(String, u32)>,
@@ -1216,7 +1216,7 @@ fn apply_result_edit(sender: &Sender<Message>, root: Option<&str>, content: &str
         })],
     }));
     let params = ApplyWorkspaceEditParams {
-        label: Some("Resposta HTTP".into()),
+        label: Some("HTTP response".into()),
         edit: WorkspaceEdit {
             changes: None,
             document_changes: Some(DocumentChanges::Operations(ops)),
@@ -1236,7 +1236,7 @@ fn apply_result_edit(sender: &Sender<Message>, root: Option<&str>, content: &str
 /// Indicador de progresso na barra de status do Zed (`$/progress`).
 ///
 /// É o único indicador que não depende de layout nem de foco. O Code Lens
-/// `⏳ Enviando…` não serve para isso: o Zed só desenha o que ele pediu, e ele
+/// `⏳ Sending…` não serve para isso: o Zed só desenha o que ele pediu, e ele
 /// para de pedir os lenses do `.http` de origem assim que o buffer de
 /// resultado vira o editor ativo — o que acontece já na primeira requisição.
 struct Progress<'a> {
@@ -1434,8 +1434,8 @@ fn format_response(
 
 /// Mantém a entrada de `inflight` viva enquanto a requisição roda e a remove no
 /// fim — inclusive se a thread entrar em pânico, que antes deixava o Code Lens
-/// preso em `⏳ Enviando…` para sempre e todo clique seguinte era recusado com
-/// "já está em andamento".
+/// preso em `⏳ Sending…` para sempre e todo clique seguinte era recusado com
+/// "is already running".
 struct Inflight<'a> {
     state: &'a Shared,
     sender: &'a Sender<Message>,
@@ -1458,7 +1458,7 @@ fn perform_request(
     file_vars: HashMap<String, String>,
     dotenv: HashMap<String, String>,
     root: Option<String>,
-    // Quando o `⏳ Enviando…` foi pedido, para respeitar MIN_LOADING.
+    // Quando o `⏳ Sending…` foi pedido, para respeitar MIN_LOADING.
     loading_since: Instant,
 ) {
     let _inflight = Inflight {
@@ -1504,13 +1504,13 @@ fn perform_request(
 
     // Indicador de progresso na barra de status, encerrado no fim desta função
     // (inclusive em caso de erro) pelo Drop.
-    let _progress = Progress::begin(sender, format!("Enviando {method} {}", url_no_query(&url)));
+    let _progress = Progress::begin(sender, format!("Sending {method} {}", url_no_query(&url)));
 
-    // Feedback imediato no painel de resultado: "Enviando…" no lugar da resposta
+    // Feedback imediato no painel de resultado: "Sending…" no lugar da resposta
     // anterior. É o que dá para garantir — o Code Lens depende de o Zed re-pedir
     // os lenses do .http de origem, coisa que ele deixa de fazer assim que o
     // buffer de resultado vira o editor ativo.
-    let placeholder = format!("# ⏳ Enviando…\n\n{method} {url}\n");
+    let placeholder = format!("# ⏳ Sending…\n\n{method} {url}\n");
     publish_result(state, sender, root.as_deref(), &placeholder);
 
     // Se sobrou algum {{...}} sem resolver, aborta com um erro claro em vez de
@@ -1534,11 +1534,12 @@ fn perform_request(
             .collect::<Vec<_>>()
             .join("\n");
         format!(
-            "# Erro: variáveis não resolvidas\n\n{method} {url}\n\n\
-             As seguintes variáveis não foram encontradas:\n{list}\n\n\
-             Verifique se estão definidas no próprio .http (@nome = valor) ou no \
-             .env (para {{$dotenv NOME}}). O .env é procurado a partir da pasta \
-             do arquivo .http, subindo até a raiz do workspace.\n"
+            "# Error: unresolved variables\n\n{method} {url}\n\n\
+             The following variables were not found:\n{list}\n\n\
+             Make sure they are defined in the .http file itself (@name = value) \
+             or in .env (for {{$dotenv NAME}}). The .env file is looked up \
+             starting from the .http file's folder, walking up to the workspace \
+             root.\n"
         )
     } else {
         match do_http(&method, &url, &headers, body.as_deref()) {
@@ -1569,7 +1570,7 @@ fn perform_request(
             }
             Err(e) => {
                 log(format!("erro na requisição: {e}"));
-                format!("# Erro ao executar a requisição\n\n{method} {url}\n\n{e}\n")
+                format!("# Error running the request\n\n{method} {url}\n\n{e}\n")
             }
         }
     };
@@ -1904,7 +1905,7 @@ fn code_lenses(state: &Shared, result_uri: &str, uri: &str) -> Vec<CodeLens> {
             if guard.inflight.contains(&(uri.to_string(), r.line)) {
                 CodeLens {
                     range,
-                    command: Some(LspCommand::new("⏳ Enviando…".into(), CMD_NOOP.into(), None)),
+                    command: Some(LspCommand::new("⏳ Sending…".into(), CMD_NOOP.into(), None)),
                     data: None,
                 }
             } else {
@@ -2079,8 +2080,8 @@ fn handle_execute_command(connection: &Connection, state: &Shared, params: Execu
         show_message(
             &connection.sender,
             MessageType::WARNING,
-            "Este botão ficou preso a uma versão antiga do arquivo. \
-             Feche e reabra este .http para os botões voltarem a valer.",
+            "This button is stuck on an outdated version of the file. \
+             Close and reopen this .http file to make the buttons work again.",
         );
         return;
     };
@@ -2117,7 +2118,7 @@ fn handle_execute_command(connection: &Connection, state: &Shared, params: Execu
         show_message(
             &connection.sender,
             MessageType::WARNING,
-            format!("⏳ {what} já está em andamento — aguarde a resposta."),
+            format!("⏳ {what} is already running — wait for the response."),
         );
         return;
     }

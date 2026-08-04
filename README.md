@@ -185,11 +185,11 @@ Se nenhuma das quatro funcionar, o Zed mostra o motivo da falha.
   `# @name`, quando presente.
 - Ao clicar, a requisição roda numa thread separada (o editor não trava) e o
   progresso aparece em três lugares, em ordem de confiabilidade:
-  1. **`# ⏳ Enviando…` no painel de resultado**, imediatamente, no lugar da
+  1. **`# ⏳ Sending…` no painel de resultado**, imediatamente, no lugar da
      resposta anterior. É o feedback principal;
   2. **barra de status do Zed**, via `$/progress` (`window/workDoneProgress/create`
      + `begin`/`end`). Não depende de layout nem de foco;
-  3. **o Code Lens vira `⏳ Enviando…`** — quando o Zed pede.
+  3. **o Code Lens vira `⏳ Sending…`** — quando o Zed pede.
 
   **O `⏳` no Code Lens depende do layout dos painéis.** O Zed só pede os lenses
   dos buffers *visíveis* de cada editor (`visible_buffers`), então:
@@ -207,7 +207,7 @@ Se nenhuma das quatro funcionar, o Zed mostra o motivo da falha.
   servidor — daí os outros dois indicadores acima, e a trava abaixo.
 - **Uma requisição por vez, por linha.** Clicar de novo enquanto ela está em
   andamento não dispara uma segunda: o clique é barrado no servidor (`inflight`)
-  e vira um aviso `⏳ <nome> já está em andamento`. A trava tem que ficar aí
+  e vira um aviso `⏳ <nome> is already running`. A trava tem que ficar aí
   justamente porque o botão nem sempre chega a mudar para `⏳`. Requisições em
   linhas diferentes continuam podendo rodar em paralelo.
 - Quando o servidor consegue servir o `⏳`, ele o segura por no mínimo 400 ms
@@ -251,7 +251,7 @@ Se nenhuma das quatro funcionar, o Zed mostra o motivo da falha.
     arquivos abertos — dá para ver no log um `=== starting ===` sem nenhum
     `didClose` antes). Enquanto ele vivia só em memória, esse ciclo — invisível
     para quem está usando — apagava o token do `# @name oauthLogin`, e as
-    requisições seguintes falhavam com "variáveis não resolvidas" sem nada na tela
+    requisições seguintes falhavam com "unresolved variables" sem nada na tela
     explicando por quê.
 
     **Fechar um `.http` apaga as respostas guardadas dele** (memória e disco), com

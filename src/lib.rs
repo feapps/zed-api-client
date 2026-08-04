@@ -117,8 +117,8 @@ impl HttpRequestClientExtension {
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!(
-                    "o release {} não tem o asset `{asset_name}` para esta plataforma. \
-                     Assets disponíveis: [{available}]",
+                    "release {} has no `{asset_name}` asset for this platform. \
+                     Available assets: [{available}]",
                     release.version
                 )
             })?;
@@ -133,13 +133,13 @@ impl HttpRequestClientExtension {
                 &zed::LanguageServerInstallationStatus::Downloading,
             );
             std::fs::create_dir_all(&version_dir)
-                .map_err(|e| format!("falha ao criar {version_dir}: {e}"))?;
+                .map_err(|e| format!("failed to create {version_dir}: {e}"))?;
             zed::download_file(
                 &asset.download_url,
                 &binary_path,
                 zed::DownloadedFileType::Gzip,
             )
-            .map_err(|e| format!("falha ao baixar {}: {e}", asset.download_url))?;
+            .map_err(|e| format!("failed to download {}: {e}", asset.download_url))?;
             zed::make_file_executable(&binary_path)?;
 
             // Remove instalações de versões anteriores.
