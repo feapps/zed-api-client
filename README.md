@@ -100,6 +100,35 @@ does all the work — parsing, variable resolution and the HTTP requests).
 
 ## Testing locally in Zed
 
+### Prerequisites
+
+**Rust ≥ 1.85, installed via [`rustup`](https://rustup.rs)** — not the distro
+package. Zed compiles the dev extension to `wasm32-wasip2` itself, with the
+`cargo` it finds on `PATH`, and gets that target by running `rustup target add`;
+an apt/dnf `rustc` has no rustup to do that. Ubuntu 24.04, for instance, ships
+1.75, which is too old on two counts — `Cargo.lock` is version 4 (needs cargo ≥
+1.78) and `lsp-server 0.10` requires `edition2024` (needs 1.85):
+
+```
+error: failed to parse lock file ...
+  lock file version 4 requires `-Znext-lockfile-bump`
+
+error: feature `edition2024` is required
+```
+
+```sh
+sudo apt remove rustc cargo   # otherwise /usr/bin/rustc shadows rustup's
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env" && rustc --version   # must be >= 1.85
+```
+
+There is no way around this while the extension is not in Zed's store: `install
+dev extension` always compiles `src/lib.rs`. Building the *language server*,
+on the other hand, is optional — see
+[Testing without building the language server](#testing-without-building-the-language-server).
+
+### Steps
+
 1. Build the language server: `cargo build -p http_request_client_lsp`.
    To use the extension in **other** projects from this checkout, install it on
    `$PATH`: `cargo install --path lsp-server`. (Anyone installing the extension
@@ -120,6 +149,42 @@ needed on the fallback path (clients that don't handle `window/showDocument`),
 where the result tab is opened via `workspace/applyEdit` and is born "dirty"
 (unsaved): autosave makes it clean, and that is what allows subsequent responses
 to be updated on disk without stealing focus from the editor.
+
+### Testing without building the language server
+
+Step 1 can be skipped by using the binary already published in the release,
+which is the same one users get. Download the asset for the platform, unpack it
+(the asset is a gzip of the raw binary) and make it executable:
+
+```sh
+mkdir -p ~/.local/bin
+curl -L https://github.com/feapps/zed-api-client/releases/latest/download/http-request-client-lsp-linux-x86_64.gz \
+  | gunzip > ~/.local/bin/http-request-client-lsp
+chmod +x ~/.local/bin/http-request-client-lsp
+```
+
+Then point Zed's `settings.json` at it:
+
+```json
+{
+  "lsp": {
+    "http-request-client": {
+      "binary": { "path": "/home/you/.local/bin/http-request-client-lsp" }
+    }
+  }
+}
+```
+
+Putting the binary on `$PATH` is **not** enough here: when the folder open in
+Zed is this repository, resolution stops at `target/debug/` (step 2 of
+[How the language server binary is found](#how-the-language-server-binary-is-found))
+and never consults `$PATH` — and `api.http`, the file used for testing, lives in
+this repository. The `settings.json` path is step 1, so it wins over that
+shortcut.
+
+Rust is still needed to compile the extension itself; this only avoids
+compiling the server. And because the URL above is `releases/latest`, the binary
+is the newest published one, which may be ahead of the working tree.
 
 ### If installation fails with `failed to compile grammar 'http'`
 
