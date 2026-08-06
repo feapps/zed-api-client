@@ -1,17 +1,17 @@
 id = "http-request-client"
 name = "HTTP Request Client"
-version = "0.2.0"
+version = "0.2.1"
 schema_version = 1
 authors = ["Einstein Adriano <einstein@feap.io>"]
-description = "Destaque de sintaxe e execução de requisições para arquivos .http e .rest"
+description = "Syntax highlighting and request execution for .http and .rest files"
 repository = "https://github.com/feapps/zed-api-client"
 
-# Fork de https://github.com/rest-nvim/tree-sitter-http com o patch de
-# comentários em query params multilinha (ver grammars-src/README.md).
-# O registro de extensões do Zed clona este `repository` por HTTPS ao buildar,
-# então ele precisa ser uma URL pública (não um caminho local). Para iterar no
-# grammar sem publicar, aponte temporariamente para grammars-src/tree-sitter-http
-# e reverta antes de publicar.
+# Fork of https://github.com/rest-nvim/tree-sitter-http with the patch for
+# comments inside multiline query params (see grammars-src/README.md).
+# Zed's extension registry clones this `repository` over HTTPS when building, so
+# it must be a public URL (not a local path). To iterate on the grammar without
+# publishing, point it at grammars-src/tree-sitter-http temporarily and revert
+# before publishing.
 [grammars.http]
 repository = "https://github.com/feapps/tree-sitter-http"
 rev = "66e8d6559e2f2386b43574b1c565ebcdc213b4fe"

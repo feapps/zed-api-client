@@ -431,15 +431,12 @@ struct State {
     pending_show: HashSet<RequestId>,
     /// Se o cliente tem o buffer de resultado aberto (didOpen/didClose).
     ///
-    /// Só é usado para decidir se vale pedir um `window/showDocument`, que é
-    /// idempotente: pedir para um arquivo já aberto no máximo revela a aba
-    /// existente. Por isso o `didClose` espúrio do Zed (aba de preview, mesmo
-    /// arquivo em dois painéis) deixou de ser um problema — antes ele escolhia
-    /// entre duplicar a aba e escrever a resposta num arquivo invisível.
+    /// Decide se a resposta precisa ser mostrada — por `window/showDocument`,
+    /// que é idempotente (pedir para um arquivo já aberto no máximo revela a aba
+    /// existente), ou pelo `CreateFile` do fallback, que não é: por isso, nesse
+    /// caminho, o campo também é ligado ao pedirmos a abertura, sem esperar o
+    /// `didOpen`, para dois cliques seguidos não duplicarem a aba.
     result_open: bool,
-    /// Se já criamos a aba de resultado por `applyEdit` + `CreateFile` (caminho
-    /// de fallback, para clientes sem `window/showDocument`).
-    result_created: bool,
     /// Se o buffer de resultado pode estar "sujo" porque acabamos de criá-lo por
     /// `applyEdit` — nesse estado o watcher ignora o disco e a atualização
     /// precisa ir por `applyEdit` também.
@@ -1125,16 +1122,17 @@ fn open_result(sender: &Sender<Message>, root: Option<&str>, content: &str) {
 
 /// Escreve o resultado e garante que ele esteja visível.
 ///
-/// Caminho preferido: escreve em disco e, se o cliente não tem o buffer aberto,
-/// pede um `window/showDocument`. É idempotente (não duplica aba), não deixa o
-/// buffer sujo — então as atualizações seguintes chegam pelo watcher, sem roubar
-/// o foco — e reabre a aba se ela tiver sido fechada, coisa que o antigo
-/// `result_opened` de uma via não fazia: depois de um `didClose`, as respostas
-/// iam para um arquivo que ninguém estava vendo e o clique parecia não fazer
-/// nada.
+/// Em qualquer um dos dois caminhos, uma aba fechada é reaberta: depois de um
+/// `didClose`, as respostas iriam para um arquivo que ninguém está vendo e o
+/// clique em "Send request" pareceria não fazer nada.
 ///
-/// Sem `window/showDocument` no cliente, cai no caminho antigo (`applyEdit` +
-/// `CreateFile` uma vez por sessão).
+/// Caminho preferido: escreve em disco e, se o cliente não tem o buffer aberto,
+/// pede um `window/showDocument`. É idempotente (não duplica aba) e não deixa o
+/// buffer sujo — então as atualizações seguintes chegam pelo watcher, sem roubar
+/// o foco.
+///
+/// Sem `window/showDocument` no cliente (o Zed responde `-32601` a ele), cai no
+/// caminho antigo: `applyEdit` + `CreateFile` para abrir, disco para atualizar.
 fn publish_result(state: &Shared, sender: &Sender<Message>, root: Option<&str>, content: &str) {
     let (use_show, result_open) = {
         let guard = lock_state(state);
@@ -1149,14 +1147,21 @@ fn publish_result(state: &Shared, sender: &Sender<Message>, root: Option<&str>, 
         return;
     }
 
-    let needs_create = {
+    // Sem `window/showDocument`, o `CreateFile` é a única forma de abrir a aba —
+    // e ele vale tanto na primeira requisição quanto depois de o usuário fechar
+    // a aba. Enquanto isto era feito uma vez por sessão, um `didClose` mandava
+    // todas as respostas seguintes para um arquivo que ninguém estava vendo, e o
+    // clique em "Send request" parecia não fazer nada.
+    let needs_open = {
         let mut guard = lock_state(state);
-        let needs = !guard.result_created;
-        guard.result_created = true;
+        let needs = !guard.result_open;
+        if needs {
+            guard.result_open = true;
+            guard.result_dirty = true;
+        }
         needs
     };
-    if needs_create {
-        lock_state(state).result_dirty = true;
+    if needs_open {
         open_result(sender, root, content);
         return;
     }
