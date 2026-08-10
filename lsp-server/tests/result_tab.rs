@@ -1,12 +1,17 @@
-//! Quantos `workspace/applyEdit` um clique em "Send request" gera.
+//! O que um clique em "Send request" manda para o cliente — e o que ele **não**
+//! pode mandar.
 //!
-//! Cada `applyEdit` num arquivo que o cliente ainda não abriu faz o Zed abrir
-//! uma aba. Dois deles em sequência, antes de o `didOpen` do primeiro chegar,
-//! abrem duas abas da mesma resposta — que é o sintoma que estes testes
-//! guardam. Não dá para verificar isso em teste de unidade: o que importa é a
-//! conversa com o cliente, então aqui o servidor roda de verdade e o teste faz o
-//! papel do Zed (inclusive recusando `window/showDocument` com `-32601`, como
-//! ele faz).
+//! Dois sintomas moram aqui, os dois só visíveis na conversa com o cliente (daí
+//! o servidor rodar de verdade e o teste fazer o papel do Zed, inclusive
+//! recusando `window/showDocument` com `-32601`, como ele faz):
+//!
+//! - **aba duplicada**: cada `applyEdit` num arquivo que o cliente ainda não
+//!   abriu faz o Zed abrir uma aba, e dois em sequência — antes de o `didOpen`
+//!   do primeiro chegar — abrem duas abas da mesma resposta;
+//! - **botão sumindo**: um `workspace/codeLens/refresh` invalida os lenses de
+//!   *todos* os buffers e o Zed só re-pede os do editor visível, que durante uma
+//!   requisição é a aba de resposta. Um refresh disparado pelo clique deixava o
+//!   `.http` de origem sem nenhum botão até ser fechado e reaberto.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -16,10 +21,14 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-/// Quanto tempo esperar as mensagens de um clique. Folgado: o servidor segura o
-/// `⏳` por 400 ms antes de terminar, e uma duplicata que só aparecesse depois
-/// disso continuaria sendo uma aba a mais.
+/// Quanto tempo esperar as mensagens de um clique. Folgado de propósito: uma
+/// duplicata que só aparecesse depois disso continuaria sendo uma aba a mais.
 const COLLECT: Duration = Duration::from_millis(2_000);
+
+/// Quanto esperar, depois do `didOpen`, para os pedidos tardios de Code Lens
+/// (`LENS_NUDGES_MS`, o último em 4 s) já terem passado. Eles são legítimos e
+/// não têm nada a ver com o clique — mas caem no mesmo canal.
+const AFTER_NUDGES: Duration = Duration::from_millis(4_500);
 
 /// Servidor HTTP mínimo, alvo das requisições do `.http` do teste.
 ///
@@ -128,21 +137,49 @@ impl Server {
     /// Clica no "Send request" da requisição da linha `line` e devolve os
     /// `workspace/applyEdit` que o servidor mandou por causa disso.
     fn click(&mut self, uri: &str, line: u32) -> Vec<Value> {
+        self.click_all(uri, line)
+            .into_iter()
+            .filter(|m| m.get("method").and_then(|v| v.as_str()) == Some("workspace/applyEdit"))
+            .collect()
+    }
+
+    /// O mesmo clique, devolvendo **tudo** o que o servidor mandou — para os
+    /// testes que verificam o que não pode aparecer.
+    fn click_all(&mut self, uri: &str, line: u32) -> Vec<Value> {
         let id = self.request(
             "workspace/executeCommand",
             json!({"command": "http.sendRequest", "arguments": [uri, line]}),
         );
-        self.wait_response(id);
 
-        let mut edits = Vec::new();
+        let mut msgs = Vec::new();
+        // A coleta começa antes da resposta do comando, e não depois: o
+        // `handle_execute_command` roda inteiro *antes* de o servidor responder,
+        // então tudo o que ele mandar direto do clique — o refresh do bug
+        // antigo, por exemplo — sai nesta primeira janela.
         let deadline = Instant::now() + COLLECT;
-        while let Some(msg) = self.recv(deadline) {
-            if msg.get("method").and_then(|v| v.as_str()) == Some("workspace/applyEdit") {
-                edits.push(msg.clone());
+        loop {
+            let msg = self.recv(deadline).expect("no response before the deadline");
+            if msg.get("id").and_then(|v| v.as_i64()) == Some(id) && msg.get("method").is_none() {
+                break;
             }
             self.answer(&msg);
+            msgs.push(msg);
         }
-        edits
+        // Depois, o que a requisição em background produzir.
+        let deadline = Instant::now() + COLLECT;
+        while let Some(msg) = self.recv(deadline) {
+            self.answer(&msg);
+            msgs.push(msg);
+        }
+        msgs
+    }
+
+    /// Consome (e responde) tudo o que chegar em `how_long`, sem guardar nada.
+    fn drain(&mut self, how_long: Duration) {
+        let deadline = Instant::now() + how_long;
+        while let Some(msg) = self.recv(deadline) {
+            self.answer(&msg);
+        }
     }
 
     /// Responde uma requisição do servidor como o Zed responderia.
@@ -345,5 +382,84 @@ fn open_tab(server: &mut Server, uri: &str) {
             "version": 1,
             "text": "",
         }}),
+    );
+}
+
+/// Servidor que aceita a conexão e nunca responde: segura a requisição em voo
+/// pelo tempo do teste, para dar tempo de perguntar os lenses no meio dela.
+fn spawn_stalled_http_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(sock) = stream else { return };
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(30));
+                drop(sock);
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}/")
+}
+
+/// Um clique não pode pedir `workspace/codeLens/refresh`.
+///
+/// O refresh invalida os lenses de *todos* os buffers e o Zed só re-pede os do
+/// editor visível — que, logo depois de um clique, é a aba de resposta. Os dois
+/// refreshes que o antigo `⏳ Sending…` exigia (um para pôr o `⏳`, outro para
+/// tirar) eram exatamente o que apagava o "Send request" do `.http` de origem,
+/// que só voltava fechando e reabrindo o arquivo.
+#[test]
+fn a_click_never_asks_for_a_code_lens_refresh() {
+    let url = spawn_http_server();
+    let root = workspace_root("no-refresh");
+    let mut server = Server::start(&root);
+    let uri = open_http_file(&mut server, &root, &url);
+    // Os pedidos tardios do `didOpen` são legítimos e não são o alvo aqui.
+    server.drain(AFTER_NUDGES);
+
+    let msgs = server.click_all(&uri, 0);
+    let refreshes: Vec<&Value> = msgs
+        .iter()
+        .filter(|m| m.get("method").and_then(|v| v.as_str()) == Some("workspace/codeLens/refresh"))
+        .collect();
+    assert!(
+        refreshes.is_empty(),
+        "a click must not invalidate the lenses: {refreshes:#?}"
+    );
+}
+
+/// Com a requisição em voo, o botão continua "Send request" — e continua sendo
+/// o comando de verdade, não um placeholder.
+///
+/// É a outra metade do teste acima: sem indicador no lens, não há o que
+/// atualizar, e sem o que atualizar não há refresh. Quem mostra "está rodando"
+/// é o `$/progress` na barra de status e o placeholder da aba de resposta.
+#[test]
+fn the_button_stays_send_request_while_the_request_runs() {
+    let url = spawn_stalled_http_server();
+    let root = workspace_root("stays-clickable");
+    let mut server = Server::start(&root);
+    let uri = open_http_file(&mut server, &root, &url);
+
+    // O servidor marca a requisição como em andamento antes de responder ao
+    // comando, então depois desta linha ela já está registrada.
+    let id = server.request(
+        "workspace/executeCommand",
+        json!({"command": "http.sendRequest", "arguments": [&uri, 0]}),
+    );
+    server.wait_response(id);
+
+    let id = server.request("textDocument/codeLens", json!({"textDocument": {"uri": &uri}}));
+    let lenses = server.wait_response(id);
+    assert_eq!(
+        lenses.pointer("/result/0/command/title").and_then(|v| v.as_str()),
+        Some("▶ Send request"),
+        "got: {lenses:#?}"
+    );
+    assert_eq!(
+        lenses.pointer("/result/0/command/command").and_then(|v| v.as_str()),
+        Some("http.sendRequest"),
+        "got: {lenses:#?}"
     );
 }

@@ -22,7 +22,9 @@ The `.env` itself is not versioned (see [`.gitignore`](./.gitignore)).
 - [x] **Syntax highlighting** for `.http`/`.rest`
 - [x] Native language server in Rust (real request execution)
 - [x] `▶ Send request` Code Lens above every HTTP method
-- [x] Loading indicator in place of the Code Lens while the request runs
+- [x] Loading indicator in the status bar and in the response panel while the
+      request runs (the Code Lens itself stays put — see
+      ["The Send request feature"](#the-send-request-feature))
 - [x] Result display (status line + headers + formatted body) in a tab on the
       side
 - [x] Language server binary resolution (Zed settings → local build of the
@@ -252,38 +254,33 @@ If none of the four work, Zed shows the reason for the failure.
   request (e.g. above `POST {{HOST}}/v1/oauth/login`). The name comes from
   `# @name`, when present.
 - On click, the request runs on a separate thread (the editor doesn't freeze) and
-  progress shows up in three places, in order of reliability:
+  progress shows up in two places:
   1. **`# ⏳ Sending…` in the result panel**, immediately, in place of the
      previous response. This is the primary feedback;
   2. **Zed's status bar**, via `$/progress` (`window/workDoneProgress/create`
-     + `begin`/`end`). Doesn't depend on layout or focus;
-  3. **the Code Lens turns into `⏳ Sending…`** — when Zed asks for it.
+     + `begin`/`end`). Doesn't depend on layout or focus.
 
-  **The `⏳` on the Code Lens depends on the panel layout.** Zed only requests
-  lenses for the *visible* buffers of each editor (`visible_buffers`), so:
+  **The Code Lens stays `▶ Send request` the whole time, on purpose.** It used to
+  switch to `⏳ Sending…`, and that cost two `workspace/codeLens/refresh` per
+  click — one to put the hourglass up, one to take it down. A refresh
+  **invalidates the lenses of every buffer**, and Zed only re-requests those of
+  the *visible* editor (`visible_buffers`). During a request the visible editor
+  is the response tab, so the `.http` behind it lost its buttons and got none
+  back until it was closed and reopened. That is the "`Send request` disappeared
+  after a while" bug, and no amount of re-asking from the server fixes it: a
+  hidden buffer is never re-fetched. The two indicators above don't depend on Zed
+  asking for anything.
 
-  - the result panel **in a split next to** the `.http` → both editors are
-    visible, Zed requests the lenses for both, and the button switches to `⏳`
-    and back normally;
-  - the result panel as a **tab in the same pane**, on top of the `.http` → the
-    `.http` editor is hidden, Zed stops requesting its lenses, and the button
-    stays frozen on `▶ Send request` even while the request is running.
-
-  In the log the difference is plain: in the first case every refresh produces a
-  `-> codeLens` for the `.http` **and** another for the result file; in the
-  second, only for the result file. This can't be worked around from the server
-  — hence the two other indicators above, and the lock below.
+  In the log the fingerprint is a `-> codeLens` for the result file with none for
+  the `.http` — Zed re-fetching only what is visible. A click must produce no
+  refresh at all; that's pinned by `a_click_never_asks_for_a_code_lens_refresh`
+  and `the_button_stays_send_request_while_the_request_runs` in
+  [`lsp-server/tests/result_tab.rs`](./lsp-server/tests/result_tab.rs).
 - **One request at a time, per line.** Clicking again while one is in flight
   doesn't fire a second one: the click is blocked on the server (`inflight`) and
   turns into a `⏳ <name> is already running` warning. The lock has to live there
-  precisely because the button doesn't always get to switch to `⏳`. Requests on
-  different lines can still run in parallel.
-- When the server does manage to serve the `⏳`, it holds it for at least 400 ms
-  (`MIN_LOADING`): Zed waits 50 ms of debounce + 30 ms before asking for the
-  lenses back, and a new `codeLens/refresh` **replaces** the pending request
-  instead of queueing it — so, on a request that takes a few ms, the refresh at
-  the end was cancelling the one at the start. The wait only delays the button
-  returning to normal: the response has already been written before it.
+  precisely because the button gives no sign that a request is running. Requests
+  on different lines can still run in parallel.
 - The response is always written to disk; if the client doesn't have the buffer
   open, a `window/showDocument` (without stealing focus) reveals the tab. On the
   `applyEdit` fallback, the first response goes through the edit itself — on that
@@ -411,15 +408,17 @@ If none of the four work, Zed shows the reason for the failure.
     behind the response tab, or in another pane, was left with no lenses at all
     until reopened. Asking for a refresh on every keystroke, as before, made
     `▶ Send request` disappear after some time of use; typing inside a JSON body
-    now invalidates nothing.
+    now invalidates nothing. Clicking the button doesn't refresh either — see
+    ["The Send request feature"](#the-send-request-feature) for why the lens has
+    no loading state.
 
   The log lives in
   `<private-dir>/http-request-client-lsp-<workspace-name>.log` — one per
   project, because Zed starts one language server per open project and with a
   fixed path the logs got mixed together. It records a
-  `-> codeLens <uri>: N lens, M sending` line per lens request, useful to tell
-  "the server didn't answer" from "the client didn't ask", and to see whether the
-  `⏳` was ever served.
+  `-> codeLens <uri>: N lens` line per lens request, which is what tells
+  "the server didn't answer" from "the client didn't ask" — the second being the
+  one that leaves a `.http` without buttons.
 - The result is formatted as status line + headers + body (pretty-printed when
   JSON) and written to `<private-dir>/requests/<workspace-name>.http`:
 

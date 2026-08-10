@@ -34,7 +34,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const CMD_SEND: &str = "http.sendRequest";
-const CMD_NOOP: &str = "http.noop";
 /// Pasta dos arquivos de resultado, fora do worktree — assim eles não sujam o
 /// projeto nem precisam de `.gitignore`.
 ///
@@ -67,15 +66,6 @@ const MAX_LOG_BYTES: u64 = 2 << 20;
 /// aba de resposta só com o cabeçalho, sem nada dizendo o motivo. Acima deste
 /// teto o corpo é cortado e a resposta ganha um aviso — ver [`read_body`].
 const MAX_RESPONSE_BODY_BYTES: u64 = 64 << 20;
-/// Tempo mínimo que o `⏳ Sending…` fica no lugar do Code Lens.
-///
-/// O Zed espera 50 ms (debounce) + 30 ms antes de pedir os lenses de volta, e
-/// cada `workspace/codeLens/refresh` novo *substitui* o pedido pendente em vez
-/// de enfileirá-lo. Numa requisição rápida (localhost responde em poucos ms) o
-/// refresh do fim cancela o do começo e o indicador nunca chega a ser
-/// desenhado. Segurar o estado de loading afasta os dois refreshes o bastante
-/// para o Zed renderizar o do meio — e dá tempo de o olho pegar.
-const MIN_LOADING: Duration = Duration::from_millis(400);
 /// Quanto esperar pela resposta de um `window/showDocument` antes de considerar
 /// que o cliente não trata a requisição (ver [`show_result`]). Folgado de
 /// propósito: desistir cedo de um cliente que só está ocupado é que abriria a
@@ -130,9 +120,9 @@ fn next_n() -> i32 {
 ///
 /// Um `unwrap()` aqui transformava um pânico em qualquer thread num servidor
 /// zumbi: o lock ficava envenenado e todas as threads seguintes morriam ao
-/// tentar tomá-lo — o processo continuava vivo, sem responder nada, e a UI ficava
-/// travada no `⏳ Sending…`. Um estado eventualmente inconsistente é bem melhor
-/// do que isso.
+/// tentar tomá-lo — o processo continuava vivo, sem responder nada, e clicar em
+/// "Send request" não surtia efeito nenhum. Um estado eventualmente inconsistente
+/// é bem melhor do que isso.
 fn lock_state(state: &Shared) -> MutexGuard<'_, State> {
     state.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -421,7 +411,8 @@ struct State {
     /// oauthLogin` morria junto — as requisições seguintes falhavam com
     /// "unresolved variables" sem nada na tela explicando por quê.
     responses: Responses,
-    /// Requisições em andamento (uri, linha) — para o indicador de loading.
+    /// Requisições em andamento (uri, linha) — guarda contra clique duplo. Não
+    /// aparece na UI: ver [`Progress`] e [`code_lenses`].
     inflight: HashSet<(String, u32)>,
     /// Raiz do workspace, para localizar o `.env`.
     root_path: Option<String>,
@@ -1135,7 +1126,7 @@ enum Reveal {
     IfClosed,
     /// Só atualiza; com a aba fechada, escreve em disco e pronto.
     ///
-    /// É o que o "⏳ Sending…" usa. Um clique publica duas vezes — o
+    /// É o que o placeholder `# ⏳ Sending…` usa. Um clique publica duas vezes — o
     /// placeholder e a resposta —, e com a aba fechada os dois queriam abri-la:
     /// saíam dois `applyEdit` em sequência, e o Zed abre uma aba para cada um
     /// que chega antes do `didOpen` do anterior. Numa requisição demorada os
@@ -1321,10 +1312,15 @@ fn apply_result_edit(sender: &Sender<Message>, root: Option<&str>, content: &str
 
 /// Indicador de progresso na barra de status do Zed (`$/progress`).
 ///
-/// É o único indicador que não depende de layout nem de foco. O Code Lens
-/// `⏳ Sending…` não serve para isso: o Zed só desenha o que ele pediu, e ele
-/// para de pedir os lenses do `.http` de origem assim que o buffer de
-/// resultado vira o editor ativo — o que acontece já na primeira requisição.
+/// É o único indicador que não depende de layout nem de foco, e junto com o
+/// placeholder da aba de resposta é todo o feedback de "está rodando".
+///
+/// O Code Lens já mostrou um `⏳ Sending…` no lugar do botão, e foi removido:
+/// trocar o texto de um lens exige um `workspace/codeLens/refresh`, que
+/// **invalida os lenses de todos os buffers** enquanto o Zed só re-pede os do
+/// editor visível — e quem está visível durante uma requisição é a aba de
+/// resposta. O `.http` de origem ficava sem botão nenhum até ser reaberto. Ver
+/// [`code_lenses`].
 struct Progress<'a> {
     sender: &'a Sender<Message>,
     token: String,
@@ -1522,7 +1518,7 @@ fn format_response(resp: &HttpResponse) -> String {
 ///
 /// O timeout merece o tratamento separado porque a leitura intuitiva dele é
 /// errada e custa tempo de investigação: desistir de esperar **não cancela** o
-/// trabalho do outro lado. Quem vê o `⏳` sumir com "timeout" clica de novo, e
+/// trabalho do outro lado. Quem vê a resposta chegar com "timeout" clica de novo, e
 /// esse segundo clique não substitui a execução anterior — soma outra em cima
 /// dela, ainda em andamento no servidor. O sintoma (todas as tentativas
 /// seguintes estourando também, mesmo pedindo menos dados) é indistinguível de
@@ -1562,20 +1558,17 @@ fn format_request_error(
 }
 
 /// Mantém a entrada de `inflight` viva enquanto a requisição roda e a remove no
-/// fim — inclusive se a thread entrar em pânico, que antes deixava o Code Lens
-/// preso em `⏳ Sending…` para sempre e todo clique seguinte era recusado com
+/// fim — inclusive se a thread entrar em pânico, que antes deixava a guarda de
+/// clique duplo presa para sempre e todo clique seguinte era recusado com
 /// "is already running".
 struct Inflight<'a> {
     state: &'a Shared,
-    sender: &'a Sender<Message>,
     key: (String, u32),
 }
 
 impl Drop for Inflight<'_> {
     fn drop(&mut self) {
         lock_state(self.state).inflight.remove(&self.key);
-        // O ⏳ só volta a ser "Send request" quando o Zed re-pede os lenses.
-        refresh_code_lens(self.sender);
     }
 }
 
@@ -1587,12 +1580,9 @@ fn perform_request(
     file_vars: HashMap<String, String>,
     dotenv: HashMap<String, String>,
     root: Option<String>,
-    // Quando o `⏳ Sending…` foi pedido, para respeitar MIN_LOADING.
-    loading_since: Instant,
 ) {
     let _inflight = Inflight {
         state,
-        sender,
         key: (uri.clone(), req.line),
     };
 
@@ -1644,9 +1634,9 @@ fn perform_request(
     let _progress = Progress::begin(sender, format!("Sending {method} {}", url_no_query(&url)));
 
     // Feedback imediato no painel de resultado: "Sending…" no lugar da resposta
-    // anterior. É o que dá para garantir — o Code Lens depende de o Zed re-pedir
-    // os lenses do .http de origem, coisa que ele deixa de fazer assim que o
-    // buffer de resultado vira o editor ativo.
+    // anterior. Junto com o `$/progress` acima, é todo o indicador de "está
+    // rodando" — o botão do `.http` fica fixo em "Send request" de propósito
+    // (ver [`Progress`]).
     //
     // Com a aba fechada não há painel onde mostrá-lo, e abri-la aqui duplicaria
     // a aba (ver [`Reveal`]); nesse caso o indicador é o `$/progress` na barra
@@ -1723,13 +1713,7 @@ fn perform_request(
 
     log(format!("result at {}", result_uri_for(root.as_deref())));
     publish_result(state, sender, root.as_deref(), &content, Reveal::IfClosed);
-
-    // Segura o `⏳` o mínimo combinado; o resultado já está escrito, então a
-    // espera só atrasa o botão voltar ao normal. A limpeza do inflight e o
-    // refresh dos lenses vêm depois, no Drop de `_inflight`.
-    if let Some(rest) = MIN_LOADING.checked_sub(loading_since.elapsed()) {
-        std::thread::sleep(rest);
-    }
+    // A guarda de clique duplo é liberada aqui, no Drop de `_inflight`.
 }
 
 /// `0` segundos quer dizer "sem limite", mesma convenção do
@@ -1896,7 +1880,7 @@ fn main() -> anyhow::Result<()> {
     let capabilities = ServerCapabilities {
         code_lens_provider: Some(CodeLensOptions { resolve_provider: Some(false) }),
         execute_command_provider: Some(ExecuteCommandOptions {
-            commands: vec![CMD_SEND.into(), CMD_NOOP.into()],
+            commands: vec![CMD_SEND.into()],
             work_done_progress_options: Default::default(),
         }),
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
@@ -2113,11 +2097,7 @@ fn handle_request(
             // respostas dele é cancelada.
             lock_state(state).pending_clear.remove(&uri);
             let lenses = code_lenses(state, result_uri, &uri);
-            let sending = lenses
-                .iter()
-                .filter(|l| l.command.as_ref().is_some_and(|c| c.command == CMD_NOOP))
-                .count();
-            log(format!("-> codeLens {uri}: {} lens, {sending} sending", lenses.len()));
+            log(format!("-> codeLens {uri}: {} lens", lenses.len()));
             connection.sender.send(Message::Response(Response::new_ok(req.id, lenses)))?;
         }
         "workspace/executeCommand" => {
@@ -2137,6 +2117,17 @@ fn handle_request(
     Ok(())
 }
 
+/// Os Code Lens de um `.http`: um "Send request" fixo por requisição.
+///
+/// **Fixo de propósito.** Já houve um `⏳ Sending…` aqui enquanto a requisição
+/// rodava, e ele custava dois `workspace/codeLens/refresh` por clique (um para
+/// pôr o `⏳`, outro para tirar). O refresh é global: invalida os lenses de
+/// *todos* os buffers, e o Zed só re-pede os do editor visível. Como a aba de
+/// resposta rouba a visibilidade justamente durante a requisição, o `.http` de
+/// origem perdia os botões e ficava sem nenhum até ser fechado e reaberto — o
+/// bug de "o Send request sumiu depois de um tempo". O estado de execução vive
+/// no `$/progress` da barra de status e no placeholder da aba de resposta, que
+/// não dependem de o Zed re-pedir nada.
 fn code_lenses(state: &Shared, result_uri: &str, uri: &str) -> Vec<CodeLens> {
     // Não mostra "Send request" no próprio buffer de resultado.
     if uri == result_uri {
@@ -2151,40 +2142,32 @@ fn code_lenses(state: &Shared, result_uri: &str, uri: &str) -> Vec<CodeLens> {
         .zip(keys)
         .map(|(r, (key, nth))| {
             let range = Range::new(Position::new(r.line, 0), Position::new(r.line, 0));
-            if guard.inflight.contains(&(uri.to_string(), r.line)) {
-                CodeLens {
-                    range,
-                    command: Some(LspCommand::new("⏳ Sending…".into(), CMD_NOOP.into(), None)),
-                    data: None,
-                }
-            } else {
-                let title = match &r.name {
-                    Some(n) => format!("▶ Send request  ({n})"),
-                    None => "▶ Send request".into(),
-                };
-                // O cliente congela os argumentos do comando no momento em que
-                // recebe o lens (e ancora só a *posição* na tela), então tudo
-                // aqui pode chegar velho no clique. Mandamos várias pistas de
-                // identidade, da mais estável para a mais frágil, e quem escolhe
-                // é [`resolve_request`]:
-                //
-                // - `name`: o `# @name`, que sobrevive a mudanças na URL;
-                // - `key`: método + URL + nome, que só casa se nada mudou;
-                // - `line`: certa enquanto a edição não desloca a requisição;
-                // - `method`: corroboração para o caso de cair na linha.
-                let args = vec![
-                    Value::String(uri.to_string()),
-                    Value::from(r.line),
-                    Value::String(format!("{key:016x}")),
-                    Value::from(nth),
-                    Value::String(r.name.clone().unwrap_or_default()),
-                    Value::String(r.method.clone()),
-                ];
-                CodeLens {
-                    range,
-                    command: Some(LspCommand::new(title, CMD_SEND.into(), Some(args))),
-                    data: None,
-                }
+            let title = match &r.name {
+                Some(n) => format!("▶ Send request  ({n})"),
+                None => "▶ Send request".into(),
+            };
+            // O cliente congela os argumentos do comando no momento em que
+            // recebe o lens (e ancora só a *posição* na tela), então tudo
+            // aqui pode chegar velho no clique. Mandamos várias pistas de
+            // identidade, da mais estável para a mais frágil, e quem escolhe
+            // é [`resolve_request`]:
+            //
+            // - `name`: o `# @name`, que sobrevive a mudanças na URL;
+            // - `key`: método + URL + nome, que só casa se nada mudou;
+            // - `line`: certa enquanto a edição não desloca a requisição;
+            // - `method`: corroboração para o caso de cair na linha.
+            let args = vec![
+                Value::String(uri.to_string()),
+                Value::from(r.line),
+                Value::String(format!("{key:016x}")),
+                Value::from(nth),
+                Value::String(r.name.clone().unwrap_or_default()),
+                Value::String(r.method.clone()),
+            ];
+            CodeLens {
+                range,
+                command: Some(LspCommand::new(title, CMD_SEND.into(), Some(args))),
+                data: None,
             }
         })
         .collect()
@@ -2280,9 +2263,9 @@ fn resolve_request(
 }
 
 fn handle_execute_command(connection: &Connection, state: &Shared, params: ExecuteCommandParams) {
-    if params.command == CMD_NOOP {
-        return;
-    }
+    // Um `http.noop` aqui é o clique num `⏳ Sending…` que ficou desenhado numa
+    // aba aberta antes desta versão — o Zed não troca os argumentos de um lens
+    // que já desenhou. Cai no log e para por aqui, como antes.
     if params.command != CMD_SEND {
         log(format!("unknown command: {}", params.command));
         return;
@@ -2335,8 +2318,8 @@ fn handle_execute_command(connection: &Connection, state: &Shared, params: Execu
         return;
     };
     let req = reqs[index].clone();
-    // A linha que vale é a atual, não a do lens: é ela que ancora o `⏳` e a
-    // guarda de clique duplo.
+    // A linha que vale é a atual, não a do lens: é ela que ancora a guarda de
+    // clique duplo.
     let line = req.line;
     if line != clicked_line {
         // O lens deslocou. Vale pedir os lenses de novo — em clientes que
@@ -2353,10 +2336,9 @@ fn handle_execute_command(connection: &Connection, state: &Shared, params: Execu
     }
 
     // Impede empilhar duas execuções da mesma requisição. A garantia tem que
-    // estar aqui, e não na aparência do Code Lens: o Zed só desenha os lenses
-    // que ele pede, e ele para de pedir os do `.http` de origem assim que o
-    // painel de resultado vira o editor ativo — então o botão pode continuar
-    // dizendo "Send request" mesmo com a requisição em andamento.
+    // estar aqui, e não na aparência do Code Lens: o botão fica fixo em "Send
+    // request" mesmo com a requisição em andamento (ver [`code_lenses`]), então
+    // é este `insert` que separa um clique duplo de dois envios.
     // `insert` devolve false quando a chave já estava lá.
     if !lock_state(state).inflight.insert((uri.clone(), line)) {
         let what = req
@@ -2380,15 +2362,15 @@ fn handle_execute_command(connection: &Connection, state: &Shared, params: Execu
         .map(|p| p.to_path_buf());
     let dotenv = load_dotenv(file_dir.as_deref(), root_path.as_deref());
 
-    // Pede o ⏳ no lugar do botão (o Zed atende quando está pedindo os lenses).
+    // Nenhum `refresh_code_lens` aqui: os lenses não mudam durante a requisição,
+    // e pedir refresh apagaria os botões do `.http` que está prestes a sair de
+    // foco para a aba de resposta (ver [`code_lenses`]).
     let sender = connection.sender.clone();
-    refresh_code_lens(&sender);
-    let loading_since = Instant::now();
 
     // Faz a requisição em background para não travar o loop do LSP.
     let state = Arc::clone(state);
     std::thread::spawn(move || {
-        perform_request(&state, &sender, uri, req, file_vars, dotenv, root_path, loading_since);
+        perform_request(&state, &sender, uri, req, file_vars, dotenv, root_path);
     });
 }
 
