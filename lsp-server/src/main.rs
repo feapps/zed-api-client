@@ -59,6 +59,14 @@ const MAX_RESPONSES_BYTES: usize = 8 << 20;
 /// Teto do arquivo de log: o diretório agora é estável por workspace, então o
 /// log sobrevive aos reinícios do servidor e cresceria sem fim.
 const MAX_LOG_BYTES: u64 = 2 << 20;
+/// Teto do corpo lido de uma resposta, para o servidor do outro lado não
+/// derrubar o editor mandando um corpo sem fim.
+///
+/// Existe explicitamente porque o default do ureq (10 MiB no `read_to_string`)
+/// não serve aqui: ele *erra* ao estourar, e um erro no meio do corpo deixava a
+/// aba de resposta só com o cabeçalho, sem nada dizendo o motivo. Acima deste
+/// teto o corpo é cortado e a resposta ganha um aviso — ver [`read_body`].
+const MAX_RESPONSE_BODY_BYTES: u64 = 64 << 20;
 /// Tempo mínimo que o `⏳ Sending…` fica no lugar do Code Lens.
 ///
 /// O Zed espera 50 ms (debounce) + 30 ms antes de pedir os lenses de volta, e
@@ -1455,25 +1463,25 @@ fn url_no_query(url: &str) -> &str {
     url.split_once('?').map(|(base, _)| base).unwrap_or(url)
 }
 
-fn format_response(
-    code: u16,
-    reason: &str,
-    headers: &[(String, String)],
-    body: &str,
-    content_type: &str,
-) -> String {
-    let mut out = format!("HTTP/1.1 {code} {reason}\n");
-    for (k, v) in headers {
+fn format_response(resp: &HttpResponse) -> String {
+    let mut out = format!("HTTP/1.1 {} {}\n", resp.code, resp.reason);
+    for (k, v) in &resp.headers {
         out.push_str(&format!("{k}: {v}\n"));
     }
     out.push('\n');
-    let body_fmt = if content_type.contains("json") {
-        serde_json::from_str::<Value>(body)
+    // O aviso vai antes do corpo, e não depois: um corpo cortado tem dezenas de
+    // MB, e no fim do arquivo ninguém veria. `#` é comentário na sintaxe `.http`
+    // do próprio buffer de resultado.
+    if let Some(note) = &resp.body_note {
+        out.push_str(&format!("# Warning: {note}\n\n"));
+    }
+    let body_fmt = if resp.content_type.contains("json") {
+        serde_json::from_str::<Value>(&resp.body)
             .ok()
             .and_then(|v| serde_json::to_string_pretty(&v).ok())
-            .unwrap_or_else(|| body.to_string())
+            .unwrap_or_else(|| resp.body.clone())
     } else {
-        body.to_string()
+        resp.body.clone()
     };
     out.push_str(&body_fmt);
     out.push('\n');
@@ -1643,15 +1651,15 @@ fn perform_request(
     } else {
         let started = Instant::now();
         match do_http(&method, &url, &headers, body.as_deref(), timeout) {
-            Ok((code, reason, resp_headers, resp_body, content_type)) => {
+            Ok(resp) => {
                 // Guarda status + body + headers para encadeamento (se tem nome).
                 if let Some(name) = &req.name {
-                    let body = serde_json::from_str::<Value>(&resp_body)
-                        .unwrap_or_else(|_| Value::String(resp_body.clone()));
+                    let body = serde_json::from_str::<Value>(&resp.body)
+                        .unwrap_or_else(|_| Value::String(resp.body.clone()));
                     let stored = StoredResponse {
-                        status: code,
+                        status: resp.code,
                         body,
-                        headers: resp_headers.clone(),
+                        headers: resp.headers.clone(),
                     };
                     // Persistidas fora do lock: o servidor morre a cada vez que o
                     // último `.http` fecha, e o token precisa sobreviver a isso.
@@ -1666,7 +1674,7 @@ fn perform_request(
                     };
                     save_responses(&snapshot);
                 }
-                format_response(code, &reason, &resp_headers, &resp_body, &content_type)
+                format_response(&resp)
             }
             Err(e) => {
                 let elapsed = started.elapsed();
@@ -1727,14 +1735,64 @@ fn resolve_timeout(
     (Some(DEFAULT_TIMEOUT), "default".to_string())
 }
 
-/// Faz a requisição HTTP (bloqueante). Retorna (status, reason, headers, body, content-type).
+/// Resposta HTTP já lida, pronta para virar texto na aba de resultado.
+struct HttpResponse {
+    code: u16,
+    reason: String,
+    headers: Vec<(String, String)>,
+    body: String,
+    /// Por que o corpo não é a resposta inteira, quando não é (ver [`read_body`]).
+    body_note: Option<String>,
+    content_type: String,
+}
+
+/// Lê o corpo até `limit` bytes, guardando o que chegou mesmo quando a leitura
+/// falha no meio.
+///
+/// O caminho anterior (`read_to_string().unwrap_or_default()`) transformava
+/// qualquer tropeço aqui — corpo acima do teto, timeout global estourando
+/// durante a transferência, conexão caindo antes do `Content-Length` prometido —
+/// numa string vazia, e a aba de resposta aparecia só com o cabeçalho, como se o
+/// servidor não tivesse mandado corpo nenhum. Nesses três casos os bytes que já
+/// chegaram valem mais que o vazio, então eles ficam, e a nota diz o que faltou.
+fn read_body(mut reader: impl std::io::Read, limit: u64) -> (String, Option<String>) {
+    use std::io::Read as _;
+
+    let mut buf = Vec::new();
+    // `read_to_end` mantém no buffer o que já leu quando erra no meio — é o que
+    // permite mostrar a parte que chegou.
+    let err = (&mut reader).take(limit).read_to_end(&mut buf).err();
+
+    let note = match err {
+        Some(e) => Some(format!(
+            "body incomplete: read {} bytes and then failed: {e}",
+            buf.len()
+        )),
+        // Encheu o teto: só é corte se ainda vinha coisa atrás.
+        None if buf.len() as u64 == limit => match reader.read(&mut [0u8; 1]) {
+            Ok(0) => None,
+            Ok(_) => Some(format!(
+                "body truncated at {limit} bytes; the response is larger than the limit"
+            )),
+            Err(e) => Some(format!("body incomplete: read {limit} bytes and then failed: {e}")),
+        },
+        None => None,
+    };
+
+    // Sem a feature `charset` do ureq não há conversão de encoding; o corpo vem
+    // como os bytes do servidor, e um corte no meio de um caractere multibyte
+    // não pode derrubar a resposta inteira.
+    (String::from_utf8_lossy(&buf).into_owned(), note)
+}
+
+/// Faz a requisição HTTP (bloqueante).
 fn do_http(
     method: &str,
     url: &str,
     headers: &[(String, String)],
     body: Option<&str>,
     timeout: Option<Duration>,
-) -> anyhow::Result<(u16, String, Vec<(String, String)>, String, String)> {
+) -> anyhow::Result<HttpResponse> {
     use ureq::http::Request;
 
     let config = ureq::Agent::config_builder()
@@ -1775,8 +1833,23 @@ fn do_http(
         resp_headers.push((n, v));
     }
 
-    let resp_body = resp.body_mut().read_to_string().unwrap_or_default();
-    Ok((code, reason, resp_headers, resp_body, content_type))
+    // O teto é aplicado aqui, e não pelo `limit()` do ureq: o dele vira erro e
+    // joga fora o que já tinha sido lido, enquanto o de [`read_body`] corta e
+    // avisa.
+    let reader = resp.body_mut().with_config().reader();
+    let (body, body_note) = read_body(reader, MAX_RESPONSE_BODY_BYTES);
+    if let Some(note) = &body_note {
+        log(format!("{method} {}: {note}", url_no_query(url)));
+    }
+
+    Ok(HttpResponse {
+        code,
+        reason,
+        headers: resp_headers,
+        body,
+        body_note,
+        content_type,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2283,4 +2356,81 @@ fn handle_execute_command(connection: &Connection, state: &Shared, params: Execu
     std::thread::spawn(move || {
         perform_request(&state, &sender, uri, req, file_vars, dotenv, root_path, loading_since);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read as _;
+    use std::net::TcpListener;
+
+    /// Sobe um servidor de uma requisição só na loopback e devolve a URL dele.
+    ///
+    /// `declared_len` é o `Content-Length` anunciado; passar um valor maior que
+    /// `body.len()` simula a conexão caindo no meio do corpo.
+    fn serve_once(body: Vec<u8>, declared_len: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            // Consome a requisição até o fim dos headers.
+            let mut seen = Vec::new();
+            let mut byte = [0u8; 1];
+            while !seen.ends_with(b"\r\n\r\n") {
+                match sock.read(&mut byte) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => seen.push(byte[0]),
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/plain\r\n\
+                 Content-Length: {declared_len}\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.write_all(&body);
+        });
+        format!("http://127.0.0.1:{port}/")
+    }
+
+    #[test]
+    fn big_body_is_not_dropped() {
+        // Acima do teto default do ureq (10 MiB) para `read_to_string`, que
+        // devolvia erro e deixava a aba de resposta só com o cabeçalho.
+        let size = 11 << 20;
+        let url = serve_once(vec![b'a'; size], size);
+        let resp =
+            do_http("GET", &url, &[], None, Some(Duration::from_secs(30))).expect("request");
+        assert_eq!(resp.code, 200);
+        assert_eq!(resp.body.len(), size);
+        assert!(resp.body_note.is_none(), "note: {:?}", resp.body_note);
+    }
+
+    #[test]
+    fn interrupted_body_keeps_what_arrived() {
+        // Promete 1 MiB e entrega metade: a conexão cai no meio do corpo.
+        let sent = 512 << 10;
+        let url = serve_once(vec![b'a'; sent], 1 << 20);
+        let resp =
+            do_http("GET", &url, &[], None, Some(Duration::from_secs(30))).expect("request");
+        assert_eq!(resp.body.len(), sent);
+        let note = resp.body_note.as_deref().expect("note");
+        assert!(note.contains("incomplete"), "note: {note}");
+        assert!(format_response(&resp).contains("# Warning: body incomplete"));
+    }
+
+    #[test]
+    fn body_at_the_limit_is_not_reported_as_truncated() {
+        let (body, note) = read_body(&b"hello"[..], 5);
+        assert_eq!(body, "hello");
+        assert_eq!(note, None);
+    }
+
+    #[test]
+    fn body_over_the_limit_is_cut_with_a_warning() {
+        let (body, note) = read_body(&b"hello world"[..], 5);
+        assert_eq!(body, "hello");
+        assert!(note.expect("note").contains("truncated at 5 bytes"));
+    }
 }
