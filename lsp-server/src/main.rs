@@ -1128,6 +1128,23 @@ fn open_result(sender: &Sender<Message>, root: Option<&str>, content: &str) {
     apply_result_edit(sender, root, content, true);
 }
 
+/// Se uma publicação pode abrir a aba de resultado.
+#[derive(Clone, Copy, PartialEq)]
+enum Reveal {
+    /// Abre a aba quando ela não está aberta.
+    IfClosed,
+    /// Só atualiza; com a aba fechada, escreve em disco e pronto.
+    ///
+    /// É o que o "⏳ Sending…" usa. Um clique publica duas vezes — o
+    /// placeholder e a resposta —, e com a aba fechada os dois queriam abri-la:
+    /// saíam dois `applyEdit` em sequência, e o Zed abre uma aba para cada um
+    /// que chega antes do `didOpen` do anterior. Numa requisição demorada os
+    /// dois ficavam longe um do outro e a segunda aba não aparecia; num
+    /// `localhost` que responde (ou falha) na hora, aparecia. Abrir é tarefa de
+    /// quem tem o que mostrar.
+    Never,
+}
+
 /// Escreve o resultado e garante que ele esteja visível.
 ///
 /// Em qualquer um dos dois caminhos, uma aba fechada é reaberta: depois de um
@@ -1141,11 +1158,24 @@ fn open_result(sender: &Sender<Message>, root: Option<&str>, content: &str) {
 ///
 /// Sem `window/showDocument` no cliente (o Zed responde `-32601` a ele), cai no
 /// caminho antigo: `applyEdit` + `CreateFile` para abrir, disco para atualizar.
-fn publish_result(state: &Shared, sender: &Sender<Message>, root: Option<&str>, content: &str) {
+fn publish_result(
+    state: &Shared,
+    sender: &Sender<Message>,
+    root: Option<&str>,
+    content: &str,
+    reveal: Reveal,
+) {
     let (use_show, result_open) = {
         let guard = lock_state(state);
         (guard.use_show_document(), guard.result_open)
     };
+
+    // Nada a revelar e nada aberto: o conteúdo fica em disco esperando quem
+    // abrir a aba — inclusive a publicação da resposta, logo em seguida.
+    if reveal == Reveal::Never && !result_open {
+        write_result(root, content);
+        return;
+    }
 
     if use_show {
         write_result(root, content);
@@ -1237,7 +1267,7 @@ fn fall_back_to_apply_edit(state: &Shared, sender: &Sender<Message>, root: Optio
     // O conteúdo já está em disco; reabre por lá para o usuário não ficar sem a
     // resposta desta requisição.
     let content = std::fs::read_to_string(result_path(root)).unwrap_or_default();
-    publish_result(state, sender, root, &content);
+    publish_result(state, sender, root, &content, Reveal::IfClosed);
 }
 
 /// Substitui o conteúdo do buffer de resultado via `applyEdit`, sem criar o
@@ -1617,8 +1647,12 @@ fn perform_request(
     // anterior. É o que dá para garantir — o Code Lens depende de o Zed re-pedir
     // os lenses do .http de origem, coisa que ele deixa de fazer assim que o
     // buffer de resultado vira o editor ativo.
+    //
+    // Com a aba fechada não há painel onde mostrá-lo, e abri-la aqui duplicaria
+    // a aba (ver [`Reveal`]); nesse caso o indicador é o `$/progress` na barra
+    // de status, e a aba abre quando a resposta chega.
     let placeholder = format!("# ⏳ Sending…\n\n{method} {url}\n");
-    publish_result(state, sender, root.as_deref(), &placeholder);
+    publish_result(state, sender, root.as_deref(), &placeholder, Reveal::Never);
 
     // Se sobrou algum {{...}} sem resolver, aborta com um erro claro em vez de
     // mandar uma URI/headers inválidos ao ureq ("invalid uri character").
@@ -1688,7 +1722,7 @@ fn perform_request(
     };
 
     log(format!("result at {}", result_uri_for(root.as_deref())));
-    publish_result(state, sender, root.as_deref(), &content);
+    publish_result(state, sender, root.as_deref(), &content, Reveal::IfClosed);
 
     // Segura o `⏳` o mínimo combinado; o resultado já está escrito, então a
     // espera só atrasa o botão voltar ao normal. A limpeza do inflight e o
