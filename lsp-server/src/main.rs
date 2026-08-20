@@ -2437,6 +2437,26 @@ mod tests {
     }
 
     #[test]
+    fn json_formatting_preserves_object_key_order() {
+        let resp = HttpResponse {
+            code: 200,
+            reason: "OK".into(),
+            headers: Vec::new(),
+            body: r#"{"id":4856346,"net_amount":0,"amount":0,"status":0}"#.into(),
+            body_note: None,
+            content_type: "application/json".into(),
+        };
+
+        let formatted = format_response(&resp);
+        let id = formatted.find("\"id\"").expect("id");
+        let net_amount = formatted.find("\"net_amount\"").expect("net_amount");
+        let amount = formatted.find("\"amount\"").expect("amount");
+        let status = formatted.find("\"status\"").expect("status");
+
+        assert!(id < net_amount && net_amount < amount && amount < status);
+    }
+
+    #[test]
     fn body_at_the_limit_is_not_reported_as_truncated() {
         let (body, note) = read_body(&b"hello"[..], 5);
         assert_eq!(body, "hello");
